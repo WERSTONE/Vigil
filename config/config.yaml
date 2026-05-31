@@ -1,0 +1,61 @@
+# Vigil 配置文件 — 泵房多任务监控系统
+
+# ── 模型架构 ──
+model:
+  input_size: [640, 640]
+  backbone: "yolov8n"           # yolov8n / yolov8s
+  pretrained: true
+  num_keypoints: 17             # COCO 17-point
+  anomaly_classes: 4            # fire / smoke / water_stain / water_drip
+  mask_dim: 32                  # YOLACT-style mask coefficients
+
+# ── 推理配置 ──
+inference:
+  device: "cpu"                 # cpu / cuda / tensorrt / openvino
+  precision: "fp32"             # fp32 / fp16 / int8
+  conf_threshold_person: 0.25
+  conf_threshold_anomaly: 0.15  # 烟火/漏水用更低阈值 → 降漏报
+  iou_threshold: 0.45
+
+# ── 后处理参数 ──
+postprocess:
+  roi_zones: []                 # 闯入禁区坐标 [[[x1,y1],[x2,y2],...], ...]
+  boundary_lines: []            # 越界边界线
+  fall_drop_ratio: 0.15         # 跌倒判定: 垂直下降比例阈值
+  fall_duration: 5.0            # 跌倒判定: 低姿态持续秒数
+  wave_amplitude: 0.08          # 挥手判定: 振幅/画面高度
+  wave_frequency: 1.5           # 挥手判定: 最低频率 Hz
+  wave_duration: 2.0            # 挥手判定: 持续秒数
+  fire_smoke_smooth: 3          # 烟火: 连续 N 帧确认
+  water_leak_confirm: 10        # 漏水: 持续 N 帧确认
+
+# ── 管道配置 ──
+pipeline:
+  source: "rtsp://"             # RTSP 网络摄像头地址
+  fps: 15
+  buffer_size: 30
+
+# ── 训练配置 ──
+training:
+  device: "cuda"
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.001
+  balance: "manual"             # manual / uncertainty / gradnorm
+  human_total_weight: 1.0
+  anomaly_total_weight: 0.5
+  human:
+    box_weight: 7.5
+    cls_weight: 0.5
+    helmet_weight: 1.0
+    smoking_weight: 1.0
+    kpt_weight: 12.0
+  anomaly:
+    box_weight: 7.5
+    cls_weight: 1.5
+    mask_weight: 1.0
+    focal_gamma: 2.0
+
+# ── 日志 ──
+logging:
+  level: "INFO"

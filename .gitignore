@@ -28,3 +28,11 @@ Thumbs.db
 .env
 .env.local
 *.log
+
+# Weights
+checkpoints/
+
+#self document
+target.xlsx
+CLAUDE.md
+test.mp4
