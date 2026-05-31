@@ -128,43 +128,75 @@ class PostProcessor:
         self.roi_zones = config.get("roi_zones", [])
         self.boundary_lines = config.get("boundary_lines", [])
 
-    def process_frame_v2(self, persons: List, anomalies: List, frame_h: int, frame_w: int) -> List[dict]:
+        # 时序确认: 烟火连续 N 帧 / 漏水持续 N 帧
+        self._fire_smoke_smooth = config.get("fire_smoke_smooth", 3)
+        self._water_leak_confirm = config.get("water_leak_confirm", 10)
+        self._anomaly_counters: dict = {}       # class_name → consecutive count
+        self._anomaly_triggered: set = set()    # already emitted
+
+        # 越界检测: 记录 person 上次在线哪一侧
+        self._line_sides: dict = {}
+
+    def process_frame(self, persons: List, anomalies: List, frame_h: int, frame_w: int) -> List[dict]:
         events = []
         for p in persons:
-            bbox = np.array(p.bbox) if not isinstance(p.bbox, list) else p.bbox
+            bbox = p.bbox if isinstance(p.bbox, list) else np.array(p.bbox).tolist()
             conf = float(p.confidence)
 
             if self.roi_zones:
                 cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
                 for zone in self.roi_zones:
                     if self._point_in_polygon([cx, cy], zone):
-                        events.append({"type": "intrusion", "task_id": 1, "bbox": bbox if isinstance(bbox, list) else bbox.tolist(), "confidence": conf})
+                        events.append({"type": "intrusion", "task_id": 1, "bbox": bbox, "confidence": conf})
 
             if int(p.helmet_status) == 1:
-                events.append({"type": "helmet_violation", "task_id": 2, "bbox": bbox if isinstance(bbox, list) else bbox.tolist(), "confidence": float(p.helmet_conf)})
+                events.append({"type": "helmet_violation", "task_id": 2, "bbox": bbox, "confidence": float(p.helmet_conf)})
 
             if float(p.smoking_conf) > 0.5:
-                events.append({"type": "smoking", "task_id": 4, "bbox": bbox if isinstance(bbox, list) else bbox.tolist(), "confidence": float(p.smoking_conf)})
+                events.append({"type": "smoking", "task_id": 4, "bbox": bbox, "confidence": float(p.smoking_conf)})
 
+            # 越界检测: 基于跨帧侧变更
             if self.boundary_lines:
                 cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-                for line in self.boundary_lines:
-                    if self._cross_line([cx, cy], line):
-                        events.append({"type": "boundary", "task_id": 5, "bbox": bbox if isinstance(bbox, list) else bbox.tolist(), "confidence": conf})
+                pid = hash(tuple(round(v, 1) for v in bbox))
+                for i, line in enumerate(self.boundary_lines):
+                    if self._cross_line([cx, cy], line, f"{pid}_{i}"):
+                        events.append({"type": "boundary", "task_id": 5, "bbox": bbox, "confidence": conf})
 
             if p.keypoints is not None and len(p.keypoints) > 0:
                 kp = np.array(p.keypoints)
-                pid = hash(tuple(bbox)) if isinstance(bbox, list) else hash(bbox.tobytes())
+                pid = hash(tuple(round(v, 1) for v in bbox))
                 fe = self.fall_detector.update(pid, kp, frame_h)
                 if fe: events.append(fe.__dict__)
                 we = self.wave_detector.update(pid, kp, frame_h)
                 if we: events.append(we.__dict__)
 
+        # 时序确认: 烟火/漏水需要连续多帧
+        detected_classes = {a.class_name for a in anomalies}
+        best_per_class = {}
         for a in anomalies:
-            bbox = np.array(a.bbox) if not isinstance(a.bbox, list) else a.bbox
-            events.append({"type": a.class_name, "task_id": 3 if a.class_id < 2 else 6,
-                           "bbox": bbox if isinstance(bbox, list) else bbox.tolist(),
-                           "confidence": float(a.confidence)})
+            if a.class_name not in best_per_class or a.confidence > best_per_class[a.class_name].confidence:
+                best_per_class[a.class_name] = a
+
+        for cls_name in ["fire", "smoke", "water_stain", "water_drip"]:
+            if cls_name in detected_classes:
+                self._anomaly_counters[cls_name] = self._anomaly_counters.get(cls_name, 0) + 1
+            else:
+                self._anomaly_counters[cls_name] = 0
+                self._anomaly_triggered.discard(cls_name)
+
+            count = self._anomaly_counters.get(cls_name, 0)
+            is_fire_smoke = cls_name in ("fire", "smoke")
+            threshold = self._fire_smoke_smooth if is_fire_smoke else self._water_leak_confirm
+
+            if count >= threshold and cls_name not in self._anomaly_triggered:
+                self._anomaly_triggered.add(cls_name)
+                best = best_per_class.get(cls_name)
+                if best:
+                    bbox = best.bbox if isinstance(best.bbox, list) else best.bbox.tolist()
+                    events.append({"type": cls_name, "task_id": 3 if is_fire_smoke else 6,
+                                   "bbox": bbox, "confidence": float(best.confidence)})
+
         return events
 
     @staticmethod
@@ -177,6 +209,13 @@ class PostProcessor:
             j = i
         return inside
 
-    @staticmethod
-    def _cross_line(point, line):
-        return False
+    def _cross_line(self, point, line, track_id):
+        """越界判定: 跨帧侧变更。line = [[x1,y1],[x2,y2]]"""
+        x, y = point
+        (x1, y1), (x2, y2) = line
+        cross = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
+        current_side = 1 if cross > 0 else -1
+
+        prev_side = self._line_sides.get(track_id)
+        self._line_sides[track_id] = current_side
+        return prev_side is not None and prev_side != current_side

@@ -1,5 +1,5 @@
 """
-Vigil v2 测试套件 — 架构验证 + 端到端推理 + 损失函数
+Vigil 测试套件 — 架构验证 + 端到端推理 + 损失函数
 运行: python main.py test  或  pytest tests/test_basic.py -v
 """
 import pytest
@@ -119,19 +119,20 @@ class TestDecode:
         # 模拟一个在 ROI 内的 person
         p = DecodedPerson(bbox=[50, 50, 80, 80], confidence=0.9, helmet_status=0,
                           helmet_conf=0.7, smoking_conf=0.1, keypoints=[[0]*3]*17)
-        events = pp.process_frame_v2([p], [], 640, 640)
+        events = pp.process_frame([p], [], 640, 640)
         assert any(e["type"] == "intrusion" for e in events)
 
         # 未戴安全帽
         p2 = DecodedPerson(bbox=[10, 10, 50, 50], confidence=0.9, helmet_status=1,
                            helmet_conf=0.8, smoking_conf=0.1, keypoints=[[0]*3]*17)
-        events2 = pp.process_frame_v2([p2], [], 640, 640)
+        events2 = pp.process_frame([p2], [], 640, 640)
         assert any(e["type"] == "helmet_violation" for e in events2)
 
-        # 场景异常
+        # 场景异常 (需连续3帧确认 — fire/smoke 时序过滤)
         a = DecodedAnomaly(bbox=[100, 100, 200, 200], class_id=0, class_name="fire",
                            confidence=0.85, mask_coeffs=[0.0]*32)
-        events3 = pp.process_frame_v2([], [a], 640, 640)
+        for _ in range(3):
+            events3 = pp.process_frame([], [a], 640, 640)
         assert any(e["type"] == "fire" for e in events3)
 
 

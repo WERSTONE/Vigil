@@ -1,5 +1,5 @@
 """
-推理引擎 v2 — 双流架构
+推理引擎 — 双流架构
 """
 import torch
 import numpy as np
@@ -70,14 +70,27 @@ class InferenceEngine:
 
         persons = decode_human_outputs(
             outputs["ha_cls"], outputs["ha_reg"], outputs["ha_kpt"],
-            frame.shape[:2], self.conf_person, self.iou_threshold)
+            self.input_size, self.conf_person, self.iou_threshold)
 
         anomalies = decode_anomaly_outputs(
             outputs["sa_cls"], outputs["sa_reg"], outputs["sa_mask"],
-            outputs["proto"], frame.shape[:2], self.conf_anomaly, self.iou_threshold)
+            outputs["proto"], self.input_size, self.conf_anomaly, self.iou_threshold)
 
+        # Rescale from model space (input_size) to original frame space
         h, w = frame.shape[:2]
-        events = self.postprocessor.process_frame_v2(persons, anomalies, h, w)
+        scale_x, scale_y = w / self.input_size[0], h / self.input_size[1]
+        for p in persons:
+            p.bbox = [p.bbox[0] * scale_x, p.bbox[1] * scale_y,
+                      p.bbox[2] * scale_x, p.bbox[3] * scale_y]
+            if p.keypoints:
+                for k in p.keypoints:
+                    k[0] *= scale_x
+                    k[1] *= scale_y
+        for a in anomalies:
+            a.bbox = [a.bbox[0] * scale_x, a.bbox[1] * scale_y,
+                      a.bbox[2] * scale_x, a.bbox[3] * scale_y]
+
+        events = self.postprocessor.process_frame(persons, anomalies, h, w)
         latency = (time.perf_counter() - t0) * 1000
 
         return InferenceResult(frame_id=self.frame_count, timestamp=time.time(),

@@ -115,7 +115,8 @@ def cmd_live(args):
                                   fps=config["pipeline"]["fps"])
         pipeline.start()
         try:
-            while pipeline.running: pass
+            while pipeline.running:
+                time.sleep(0.1)
         except KeyboardInterrupt:
             pipeline.stop()
         return

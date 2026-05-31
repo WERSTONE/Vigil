@@ -1,5 +1,5 @@
 """
-Vigil v2 — 双流多任务模型 (Human + Scene)
+Vigil — 双流多任务模型 (Human + Scene)
 CSPDarkNet → FPN-PAN(P2-P5) → HumanAnalysisHead + SceneAnomalyHead + ProtoBranch
 """
 import torch
@@ -177,7 +177,7 @@ class ProtoBranch(nn.Module):
 
 class VigilMultiTaskModel(nn.Module):
     """
-    Vigil v2 双流多任务模型。
+    Vigil 双流多任务模型。
 
     HumanAnalysisHead (N2-N5): person bbox + helmet(3) + smoking + 17 kpts → 任务 1,2,4,5,7,8
     SceneAnomalyHead  (N3-N5): fire/smoke/stain/drip bbox + 32 mask coeffs → 任务 3,6
@@ -237,7 +237,7 @@ def _make_grid(nx, ny, device):
 
 def decode_human_outputs(ha_cls, ha_reg, ha_kpt, input_shape, conf_threshold=0.25, iou_threshold=0.45, reg_max=16):
     """
-    解码 HA Head 原始输出 → DecodedPerson 列表。
+    解码 HA Head 原始输出 → DecodedPerson 列表。input_shape = (model_H, model_W)。
 
     ha_cls: List[4] of [B,5,Hi,Wi]  — person_conf + helmet(3) + smoking
     ha_reg: List[4] of [B,64,Hi,Wi] — bbox DFL bins
@@ -257,19 +257,24 @@ def decode_human_outputs(ha_cls, ha_reg, ha_kpt, input_shape, conf_threshold=0.2
 
         # Grid
         grid = _make_grid(W, H, cls_t.device)
-        strides = input_shape[0] / W
-        reg_t[..., :2] = (reg_t[..., :2] + grid) * strides
-        reg_t[..., 2:4] = reg_t[..., 2:4] * strides * 2
+        stride = input_shape[0] / W
+        reg_t[..., :2] = (reg_t[..., :2] + grid) * stride
+        reg_t[..., 2:4] = reg_t[..., 2:4] * stride * 2
 
         # xyxy
         cx, cy, w, h = reg_t[..., 0], reg_t[..., 1], reg_t[..., 2], reg_t[..., 3]
         bboxes = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
 
+        # Scale keypoints per-scale before concatenation
+        kpt_flat = kpt_t.reshape(B, -1, 51)
+        kpt_flat[..., 0::3] *= stride
+        kpt_flat[..., 1::3] *= stride
+
         all_bboxes.append(bboxes.reshape(B, -1, 4))
         all_confs.append(cls_t[..., 0:1].reshape(B, -1).sigmoid())
         all_helmets.append(cls_t[..., 1:4].reshape(B, -1, 3))
         all_smokings.append(cls_t[..., 4:5].reshape(B, -1).sigmoid())
-        all_kpts.append(kpt_t.reshape(B, -1, 51))
+        all_kpts.append(kpt_flat)
 
     bboxes = torch.cat(all_bboxes, dim=1)[0]       # [N,4]
     confs = torch.cat(all_confs, dim=1)[0]           # [N]
@@ -299,10 +304,8 @@ def decode_human_outputs(ha_cls, ha_reg, ha_kpt, input_shape, conf_threshold=0.2
         order = order[1:][ious < iou_threshold]
 
     results = []
-    stride = input_shape[0] / bboxes.new_tensor([H for _, _, H, _ in [ha_cls[0].shape]]).float()
     for idx in keep_indices[:50]:  # max 50 persons
         k = kpts[idx].view(17, 3)
-        k[..., :2] = k[..., :2] * stride
         results.append(DecodedPerson(
             bbox=bboxes[idx].clamp(0).tolist(),
             confidence=confs[idx].detach().item(),
@@ -315,7 +318,7 @@ def decode_human_outputs(ha_cls, ha_reg, ha_kpt, input_shape, conf_threshold=0.2
 
 
 def decode_anomaly_outputs(sa_cls, sa_reg, sa_mask, proto, input_shape, conf_threshold=0.15, iou_threshold=0.45):
-    """解码 SA Head → DecodedAnomaly 列表。"""
+    """解码 SA Head → DecodedAnomaly 列表。input_shape = (model_H, model_W)。"""
     CLASS_NAMES = ["fire", "smoke", "water_stain", "water_drip"]
     all_bboxes, all_scores, all_classes, all_coeffs = [], [], [], []
 
