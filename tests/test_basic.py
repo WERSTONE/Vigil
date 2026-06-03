@@ -39,7 +39,7 @@ class TestArchitecture:
         ha.eval()
         feats = [torch.randn(1, c, h, w) for c, h, w in [(32, 160, 160), (64, 80, 80), (128, 40, 40), (256, 20, 20)]]
         cls_o, reg_o, kpt_o = ha(feats)
-        assert all(o.shape[1] == 5 for o in cls_o)   # person + helmet + smoking
+        assert all(o.shape[1] == 4 for o in cls_o)   # person + helmet(on/off) + smoking
         assert all(o.shape[1] == 64 for o in reg_o)   # 4 × 16 DFL
         assert all(o.shape[1] == 51 for o in kpt_o)   # 17 × 3
 
@@ -48,7 +48,7 @@ class TestArchitecture:
         sa.eval()
         feats = [torch.randn(1, c, h, w) for c, h, w in [(64, 80, 80), (128, 40, 40), (256, 20, 20)]]
         cls_o, reg_o, mask_o = sa(feats)
-        assert all(o.shape[1] == 4 for o in cls_o)
+        assert all(o.shape[1] == 2 for o in cls_o)   # fire + water
         assert all(o.shape[1] == 64 for o in reg_o)
         assert all(o.shape[1] == 32 for o in mask_o)
 
@@ -107,11 +107,11 @@ class TestDecode:
         for p in persons:
             assert isinstance(p, DecodedPerson)
             assert len(p.bbox) == 4
-            assert 0 <= p.helmet_status <= 2
+            assert 0 <= p.helmet_status <= 1
             assert len(p.keypoints) == 17
         for a in anomalies:
             assert isinstance(a, DecodedAnomaly)
-            assert a.class_name in ["fire", "smoke", "water_stain", "water_drip"]
+            assert a.class_name in ["fire", "water"]
 
     def test_postprocessor(self):
         from postprocess.temporal import PostProcessor
@@ -167,7 +167,7 @@ class TestLoss:
     def test_anomaly_loss(self):
         from models.loss import AnomalyLoss
         al = AnomalyLoss()
-        assert al.focal_gamma == 2.0
+        assert al.cls_w == 1.5
 
     def test_multitask_loss(self):
         from models.loss import VigilMultiTaskLoss

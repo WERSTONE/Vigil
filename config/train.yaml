@@ -1,0 +1,109 @@
+# Vigil 训练配置
+
+# ── 模型 ──
+model:
+  variant: "n"
+  pretrained: "checkpoints/yolov8n.pt"
+
+# ── 训练超参数 ──
+training:
+  batch_size: 4
+  input_size: [640, 640]
+  num_workers: 2
+  device: "cuda"        # 训练设备 (cpu / cuda)
+  ema_decay: 0.9999
+  amp: false             # 混合精度训练 (torch.cuda.amp), 仅 GPU 可用
+  save_interval: 5
+  val_interval: 1
+  log_interval: 100
+
+# ── 损失权重 ──
+loss:
+  human:
+    box: 7.5
+    person: 0.5
+    helmet: 1.0
+    smoking: 1.0
+    keypoint: 8.0
+  anomaly:
+    box: 7.5
+    cls: 1.5
+    mask: 1.0
+    focal_gamma: 2.0
+
+# ── 数据增强 ──
+augmentation:
+  mosaic:       {enable: true, prob: 0.5}
+  hsv:          {h: 0.015, s: 0.7, v: 0.4}
+  flip_lr:      {prob: 0.5}
+  scale:        [0.5, 1.5]
+
+# ── 验证 ──
+validation:
+  enabled: true
+  batch_size: 4
+  early_stop_patience: 15
+  topk_checkpoints: 3
+
+# ── LR 调度 ──
+lr_schedule:
+  type: "cosine"
+  min_lr_ratio: 0.01
+
+# ── 多阶段训练 ──
+stages:
+  # ── 第一阶段: backbone 冻结, 仅训练 head (10 epoch) ──
+  head_warmup:
+    epochs: 5
+    datasets:
+      person:     {path: "data/processed/person",      weight: 1.0}
+      helmet:     {path: "data/processed/helmet",      weight: 1.0}
+      fire_smoke: {path: "data/processed/fire_smoke",  weight: 1.0}
+      smoking:    {path: "data/processed/smoking",     weight: 1.0}
+      water_leak: {path: "data/processed/water_leak",  weight: 1.0}
+
+    freeze: ["backbone"]
+    amp: false            # 随机初始化 Neck/Head 在 FP16 下溢出, 禁用
+    optimizer:
+      lr: 0.001
+      weight_decay: 0.0001
+      warmup_epochs: 1
+    balance: "manual"
+    human_weight: 1.0
+    anomaly_weight: 0.5
+    output: "checkpoints/head_warmup"
+
+  # ── 第二阶段: 全模型预训练 (100 epoch) ──
+  pretrain:
+    epochs: 50
+    datasets:
+      person:     {path: "data/processed/person",      weight: 1.0}
+      helmet:     {path: "data/processed/helmet",      weight: 1.0}
+      fire_smoke: {path: "data/processed/fire_smoke",  weight: 1.0}
+      smoking:    {path: "data/processed/smoking",     weight: 1.0}
+      water_leak: {path: "data/processed/water_leak",  weight: 1.0}
+
+    freeze: []
+    optimizer:
+      lr: 0.0005
+      weight_decay: 0.0001
+      warmup_epochs: 3
+    balance: "manual"
+    human_weight: 1.0
+    anomaly_weight: 0.5
+    pretrained: "checkpoints/head_warmup_best.pt"
+    output: "checkpoints/pretrain"
+
+  # ── 第三阶段: 领域微调 (50 epoch) ──
+  finetune:
+    epochs: 50
+    datasets:
+      custom: {path: "data/raw/custom", weight: 1.0}
+    freeze: ["backbone"]
+    optimizer:
+      lr: 0.0001
+      weight_decay: 0.0001
+      warmup_epochs: 1
+    balance: "uncertainty"
+    pretrained: "checkpoints/pretrain_best.pt"
+    output: "checkpoints/finetune"

@@ -178,7 +178,7 @@ class PostProcessor:
             if a.class_name not in best_per_class or a.confidence > best_per_class[a.class_name].confidence:
                 best_per_class[a.class_name] = a
 
-        for cls_name in ["fire", "smoke", "water_stain", "water_drip"]:
+        for cls_name in ["fire", "water"]:
             if cls_name in detected_classes:
                 self._anomaly_counters[cls_name] = self._anomaly_counters.get(cls_name, 0) + 1
             else:
@@ -186,15 +186,15 @@ class PostProcessor:
                 self._anomaly_triggered.discard(cls_name)
 
             count = self._anomaly_counters.get(cls_name, 0)
-            is_fire_smoke = cls_name in ("fire", "smoke")
-            threshold = self._fire_smoke_smooth if is_fire_smoke else self._water_leak_confirm
+            is_fire = cls_name == "fire"
+            threshold = self._fire_smoke_smooth if is_fire else self._water_leak_confirm
 
             if count >= threshold and cls_name not in self._anomaly_triggered:
                 self._anomaly_triggered.add(cls_name)
                 best = best_per_class.get(cls_name)
                 if best:
                     bbox = best.bbox if isinstance(best.bbox, list) else best.bbox.tolist()
-                    events.append({"type": cls_name, "task_id": 3 if is_fire_smoke else 6,
+                    events.append({"type": cls_name, "task_id": 3 if is_fire else 6,
                                    "bbox": bbox, "confidence": float(best.confidence)})
 
         return events
