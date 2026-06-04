@@ -67,6 +67,14 @@ def _wiou_v3_loss(pred_xyxy, target_xyxy, delta=1.5):
     return (r * l_w1).mean()
 
 
+def _focal_bce(pred_logits, target, gamma=2.0, pos_weight=1.0):
+    """Focal BCE: 聚焦难样本, pos_weight 提升少数类."""
+    bce = F.binary_cross_entropy_with_logits(pred_logits, target, reduction="none")
+    pt = torch.exp(-bce)
+    alpha_t = torch.where(target > 0.5, pos_weight, 1.0)
+    return (alpha_t * (1 - pt) ** gamma * bce).mean()
+
+
 def _varifocal_loss(pred, target, iou_target, alpha=0.75, gamma=2.0):
     """Varifocal Loss: IoU-aware 分类损失.
 
@@ -208,14 +216,12 @@ class VigilLoss(nn.Module):
                 # 头盔 (BCE: target=1 if helmet_on, target=0 if helmet_off)
                 if targets["gt_helmet"] is not None:
                     gt_h = targets["gt_helmet"][p_kpt_idx].to(device).float()
-                    loss_helm += F.binary_cross_entropy_with_logits(
-                        helm_p[p_idx], 1 - gt_h)
+                    loss_helm += _focal_bce(helm_p[p_idx], 1 - gt_h, gamma=2.0, pos_weight=1.5)
 
-                # 吸烟 (BCE)
+                # 吸烟 (Focal BCE, 少数类 up-weight)
                 if targets["gt_smoking"] is not None:
                     gt_s = targets["gt_smoking"][p_kpt_idx].to(device).float()
-                    loss_smoke += F.binary_cross_entropy_with_logits(
-                        smok_p[p_idx], gt_s)
+                    loss_smoke += _focal_bce(smok_p[p_idx], gt_s, gamma=2.0, pos_weight=3.0)
 
         num_imgs = max(B, 1)
         return {

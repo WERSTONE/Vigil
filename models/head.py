@@ -17,24 +17,30 @@ class VigilHead(nn.Module):
         smoking: [B, 1, H, W]        — smoking logit
     """
 
-    def __init__(self, in_ch, num_classes=4, num_kpts=17, num_tower=2):
+    def __init__(self, in_ch, num_classes=4, num_kpts=17, num_tower=2, dropout=0.1):
         super().__init__()
         self.num_classes = num_classes
         self.num_kpts = num_kpts
 
         # 分类塔
-        cls_tower = [Conv(in_ch, in_ch, 3) for _ in range(num_tower)]
-        self.cls_tower = nn.Sequential(*cls_tower)
+        cls_tower = [Conv(in_ch, in_ch, 3), nn.Dropout2d(dropout)] if dropout > 0 else []
+        cls_tower += [Conv(in_ch, in_ch, 3) for _ in range(num_tower - 1)] if num_tower > 1 else []
+        cls_tower += [Conv(in_ch, in_ch, 3)] if num_tower == 0 else []
+        self.cls_tower = nn.Sequential(*cls_tower) if cls_tower else nn.Identity()
         self.cls_pred = nn.Conv2d(in_ch, num_classes, 1)
 
         # 回归塔
-        reg_tower = [Conv(in_ch, in_ch, 3) for _ in range(num_tower)]
-        self.reg_tower = nn.Sequential(*reg_tower)
+        reg_tower = [Conv(in_ch, in_ch, 3), nn.Dropout2d(dropout)] if dropout > 0 else []
+        reg_tower += [Conv(in_ch, in_ch, 3) for _ in range(num_tower - 1)] if num_tower > 1 else []
+        reg_tower += [Conv(in_ch, in_ch, 3)] if num_tower == 0 else []
+        self.reg_tower = nn.Sequential(*reg_tower) if reg_tower else nn.Identity()
         self.reg_pred = nn.Conv2d(in_ch, 4, 1)
         self.obj_pred = nn.Conv2d(in_ch, 1, 1)
 
         # 人体属性塔 (共享)
-        attr_tower = [Conv(in_ch, in_ch, 3) for _ in range(num_tower)]
+        attr_tower = [Conv(in_ch, in_ch, 3), nn.Dropout2d(dropout)] if dropout > 0 else []
+        attr_tower += [Conv(in_ch, in_ch, 3) for _ in range(num_tower - 1)] if num_tower > 1 else []
+        attr_tower += [Conv(in_ch, in_ch, 3)] if num_tower == 0 else []
         self.attr_tower = nn.Sequential(*attr_tower)
         self.kpt_pred = nn.Conv2d(in_ch, num_kpts * 3, 1)
         self.helmet_pred = nn.Conv2d(in_ch, 1, 1)

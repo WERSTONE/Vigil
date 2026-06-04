@@ -1,4 +1,4 @@
 path: "D:\\Vigil\\data\\processed\\smoking"
 train: images
 val: images
-names: {"0": "person", "1": "cigarette"}
+names: {"0": "person"}

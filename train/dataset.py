@@ -1,6 +1,6 @@
-"""统一数据集: 所有数据集标签格式一致，从 data.yaml 自动读取类映射."""
+"""统一数据集: 0=person, 1=fire, 2=water. 内置数据增强."""
 
-import os, json
+import os
 import numpy as np
 import cv2
 import torch
@@ -10,8 +10,9 @@ from dataclasses import dataclass
 
 TRAIN_SIZE = 640
 
-# data.yaml 中非 person 类名 → 模型检测类别 ID
-DETECTION_MAP = {"fire": 0, "water": 1}
+# COCO 17 点水平翻转交换对
+KPT_FLIP_PAIRS = [(0, 0), (1, 2), (3, 4), (5, 6), (7, 8), (9, 10),
+                   (11, 12), (13, 14), (15, 16)]
 
 
 @dataclass
@@ -22,30 +23,159 @@ class VigilSample:
     person_helmet: torch.Tensor      # [N] 0=on, 1=off
     person_smoke: torch.Tensor       # [N] 0=no, 1=yes
     detect_boxes: torch.Tensor       # [M, 4]
-    detect_classes: torch.Tensor     # [M] 0=fire, 1=water
-    dataset_name: str
+    detect_classes: torch.Tensor     # [M] 1=fire, 2=water
 
 
-def _load_names(root):
-    """从 data.yaml 读取 names 映射."""
-    yaml_path = Path(root) / "data.yaml"
-    if not yaml_path.exists():
-        return {}
-    names = {}
-    with open(yaml_path) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("names:"):
-                # 解析 JSON 格式: names: {"0": "person", ...}
-                json_str = line.split(":", 1)[1].strip()
-                raw = json.loads(json_str)
-                names = {int(k): v for k, v in raw.items()}
-                break
-    return names
+# ── 增强 ──
+
+def _random_hsv(img, hgain=0.015, sgain=0.7, vgain=0.4):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 0] = (hsv[..., 0] + np.random.uniform(-1, 1) * hgain * 180) % 360
+    hsv[..., 1] *= 1 + np.random.uniform(-1, 1) * sgain
+    hsv[..., 2] *= 1 + np.random.uniform(-1, 1) * vgain
+    hsv = np.clip(hsv, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
-def _parse_label(lbl_path, img_w, img_h, names):
-    """统一解析标签: class 0=person(58字段), 其他 class=检测框(5字段)."""
+def _letterbox(img, size=640, fill=114):
+    h, w = img.shape[:2]
+    r = size / max(h, w)
+    nh, nw = int(h * r), int(w * r)
+    img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    dh, dw = size - nh, size - nw
+    pt, pl = dh // 2, dw // 2
+    img = cv2.copyMakeBorder(
+        img, pt, dh - pt, pl, dw - pl, cv2.BORDER_CONSTANT, value=(fill, fill, fill))
+    return img, r, (pl, pt)
+
+
+def _tx_boxes(boxes, scale, pad_l, pad_t):
+    if boxes is None or len(boxes) == 0:
+        return boxes
+    b = boxes.copy()
+    b[:, [0, 2]] = b[:, [0, 2]] * scale + pad_l
+    b[:, [1, 3]] = b[:, [1, 3]] * scale + pad_t
+    return b
+
+
+def _tx_kpts(kpts, scale, pad_l, pad_t):
+    if kpts is None or len(kpts) == 0:
+        return kpts
+    k = kpts.copy()
+    k[:, :, 0] = k[:, :, 0] * scale + pad_l
+    k[:, :, 1] = k[:, :, 1] * scale + pad_t
+    return k
+
+
+def _flip_boxes(boxes, w):
+    if boxes is None or len(boxes) == 0:
+        return boxes
+    b = boxes.copy()
+    b[:, [0, 2]] = w - b[:, [2, 0]]
+    return b
+
+
+def _flip_kpts(kpts, w):
+    if kpts is None or len(kpts) == 0:
+        return kpts
+    k = kpts.copy()
+    k[:, :, 0] = w - k[:, :, 0]
+    for l_idx, r_idx in KPT_FLIP_PAIRS:
+        if l_idx != r_idx and l_idx < k.shape[1] and r_idx < k.shape[1]:
+            k[:, l_idx], k[:, r_idx] = k[:, r_idx].copy(), k[:, l_idx].copy()
+    return k
+
+
+def _normalize(img):
+    img = img.astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img = (img - mean) / std
+    return torch.from_numpy(img.transpose(2, 0, 1))
+
+
+# ── Mosaic 增强 ──
+
+def _mosaic4(samples, size=640):
+    """将 4 张图拼成 1 张, 合并标签."""
+    s = size // 2
+    cx = int(np.random.uniform(s // 2, s + s // 2))
+    cy = int(np.random.uniform(s // 2, s + s // 2))
+
+    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+    all_pb, all_pk, all_ph, all_ps = [], [], [], []
+    all_db, all_dc = [], []
+
+    for i, sample in enumerate(samples):
+        img_h, img_w = sample["img"].shape[:2]
+        r = min(s / img_w, s / img_h)
+        nh, nw = int(img_h * r), int(img_w * r)
+        img = cv2.resize(sample["img"], (nw, nh))
+
+        if i == 0:  # 左上
+            x1, y1 = max(0, cx - nw), max(0, cy - nh)
+            x2, y2 = min(nw, cx), min(nh, cy)
+            px, py = x1, y1
+        elif i == 1:  # 右上
+            x1, y1 = cx, max(0, cy - nh)
+            x2, y2 = min(size, cx + nw), min(nh, cy)
+            px, py = cx, y1
+        elif i == 2:  # 左下
+            x1, y1 = max(0, cx - nw), cy
+            x2, y2 = min(nw, cx), min(size, cy + nh)
+            px, py = x1, cy
+        else:  # 右下
+            x1, y1 = cx, cy
+            x2, y2 = min(size, cx + nw), min(size, cy + nh)
+            px, py = cx, cy
+
+        cw, ch = x2 - x1, y2 - y1
+        if cw > 0 and ch > 0:
+            canvas[y1:y2, x1:x2] = img[py - y1:py - y1 + ch, px - x1:px - x1 + cw]
+
+        # 坐标变换
+        scale = r
+        offset_x, offset_y = x1 - (px - x1), y1 - (py - y1)
+
+        def _mx_boxes(b, sc, ox, oy):
+            if b is None or len(b) == 0: return b
+            b = b.copy()
+            b[:, [0, 2]] = b[:, [0, 2]] * sc + ox
+            b[:, [1, 3]] = b[:, [1, 3]] * sc + oy
+            # clip
+            b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, size)
+            b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, size)
+            # 删除不可见的
+            w_mask = b[:, 2] - b[:, 0] > 2
+            h_mask = b[:, 3] - b[:, 1] > 2
+            return b[w_mask & h_mask]
+
+        def _mx_kpts(k, sc, ox, oy):
+            if k is None or len(k) == 0: return k
+            k = k.copy()
+            k[:, :, 0] = k[:, :, 0] * sc + ox
+            k[:, :, 1] = k[:, :, 1] * sc + oy
+            return k
+
+        pb = _mx_boxes(sample.get("person_boxes"), scale, offset_x, offset_y)
+        db = _mx_boxes(sample.get("detect_boxes"), scale, offset_x, offset_y)
+        pk = _mx_kpts(sample.get("person_kpts"), scale, offset_x, offset_y)
+
+        if pb is not None and len(pb) > 0:
+            all_pb.append(pb)
+            all_pk.append(pk)
+            all_ph.append(sample.get("person_helmet", np.array([])))
+            all_ps.append(sample.get("person_smoke", np.array([])))
+        if db is not None and len(db) > 0:
+            all_db.append(db)
+            all_dc.append(sample.get("detect_classes", np.array([])))
+
+    return canvas, all_pb, all_pk, all_ph, all_ps, all_db, all_dc
+
+
+# ── 解析 ──
+
+def _parse_label(lbl_path, img_w, img_h):
     p_boxes, p_kpts, p_helm, p_smoke = [], [], [], []
     d_boxes, d_cls = [], []
 
@@ -63,29 +193,22 @@ def _parse_label(lbl_path, img_w, img_h, names):
             cls_id = int(parts[0])
             vals = list(map(float, parts[1:]))
             cx, cy, w_n, h_n = vals[0], vals[1], vals[2], vals[3]
-
             x1 = (cx - w_n / 2) * img_w
             y1 = (cy - h_n / 2) * img_h
             x2 = (cx + w_n / 2) * img_w
             y2 = (cy + h_n / 2) * img_h
-            box = [x1, y1, x2, y2]
 
             if cls_id == 0 and len(vals) >= 57:
-                # person: bbox + 51 kpt + helmet + smoke
-                p_boxes.append(box)
+                p_boxes.append([x1, y1, x2, y2])
                 kpt = np.array(vals[4:55], dtype=np.float32).reshape(17, 3)
                 kpt[:, 0] *= img_w
                 kpt[:, 1] *= img_h
                 p_kpts.append(kpt)
                 p_helm.append(int(vals[55]))
                 p_smoke.append(int(vals[56]))
-            else:
-                # 检测框: 从 names 查类别
-                cls_name = names.get(cls_id, "")
-                detect_id = DETECTION_MAP.get(cls_name)
-                if detect_id is not None:
-                    d_boxes.append(box)
-                    d_cls.append(detect_id)
+            elif cls_id in (1, 2):
+                d_boxes.append([x1, y1, x2, y2])
+                d_cls.append(cls_id)
 
     return (
         torch.tensor(p_boxes, dtype=torch.float32) if p_boxes else torch.empty(0, 4),
@@ -97,77 +220,118 @@ def _parse_label(lbl_path, img_w, img_h, names):
     )
 
 
-class UnifiedDataset(Dataset):
-    """统一数据集: 所有数据集共用同一解析逻辑."""
+# ── 数据集 ──
 
-    def __init__(self, root, dataset_name, augment=True, samples=None):
+class UnifiedDataset(Dataset):
+
+    def __init__(self, root, dataset_name, augment=True):
         self.root = root
         self.name = dataset_name
         self.augment = augment
-        self.names = _load_names(root)
-
-        if samples is not None:
-            self.samples = samples
-        else:
-            img_dir = Path(root) / "images"
-            lbl_dir = Path(root) / "labels"
-            self.samples = []
-            for img_path in sorted(img_dir.glob("*")):
-                if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
-                    continue
-                lbl_path = lbl_dir / (img_path.stem + ".txt")
-                if not lbl_path.exists():
-                    lbl_path = lbl_dir / img_path.with_suffix(".txt").name
-                self.samples.append((str(img_path), lbl_path))
+        img_dir = Path(root) / "images"
+        lbl_dir = Path(root) / "labels"
+        self.samples = []
+        for img_path in sorted(img_dir.glob("*")):
+            if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                continue
+            lbl_path = lbl_dir / (img_path.stem + ".txt")
+            if not lbl_path.exists():
+                lbl_path = lbl_dir / img_path.with_suffix(".txt").name
+            self.samples.append((str(img_path), lbl_path))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        # Mosaic (50% 概率, 仅在训练时)
+        if self.augment and np.random.random() < 0.5:
+            indices = [idx] + [np.random.randint(0, len(self)) for _ in range(3)]
+            samples = []
+            for j in indices:
+                img_path_j, lbl_path_j = self.samples[j]
+                img_j = cv2.imread(img_path_j)
+                if img_j is None:
+                    continue
+                hj, wj = img_j.shape[:2]
+                pj_b, pj_k, pj_h, pj_s, dj_b, dj_c = _parse_label(lbl_path_j, wj, hj)
+                samples.append({
+                    "img": img_j,
+                    "person_boxes": pj_b.numpy() if pj_b.numel() > 0 else np.empty((0, 4)),
+                    "person_kpts": pj_k.numpy() if pj_k.numel() > 0 else np.empty((0, 17, 3)),
+                    "person_helmet": pj_h.numpy() if pj_h.numel() > 0 else np.empty(0),
+                    "person_smoke": pj_s.numpy() if pj_s.numel() > 0 else np.empty(0),
+                    "detect_boxes": dj_b.numpy() if dj_b.numel() > 0 else np.empty((0, 4)),
+                    "detect_classes": dj_c.numpy() if dj_c.numel() > 0 else np.empty(0, dtype=np.int64),
+                })
+
+            if len(samples) == 4:
+                img, all_pb, all_pk, all_ph, all_ps, all_db, all_dc = _mosaic4(samples, TRAIN_SIZE)
+
+                # 合并标签
+                p_boxes_np = np.concatenate(all_pb) if all_pb else np.empty((0, 4))
+                p_kpts_np = np.concatenate(all_pk) if all_pk else np.empty((0, 17, 3))
+                p_helm_np = np.concatenate(all_ph) if all_ph else np.empty(0)
+                p_smoke_np = np.concatenate(all_ps) if all_ps else np.empty(0)
+                d_boxes_np = np.concatenate(all_db) if all_db else np.empty((0, 4))
+                d_cls_np = np.concatenate(all_dc) if all_dc else np.empty(0, dtype=np.int64)
+
+                # HSV + flip after mosaic
+                img = _random_hsv(img)
+                if np.random.random() < 0.5:
+                    img = np.ascontiguousarray(img[:, ::-1])
+                    nw = img.shape[1]
+                    p_boxes_np = _flip_boxes(p_boxes_np, nw)
+                    p_kpts_np = _flip_kpts(p_kpts_np, nw)
+                    d_boxes_np = _flip_boxes(d_boxes_np, nw)
+
+                img_t = _normalize(img)
+                return VigilSample(
+                    image=img_t,
+                    person_boxes=torch.from_numpy(p_boxes_np).float(),
+                    person_kpts=torch.from_numpy(p_kpts_np).float(),
+                    person_helmet=torch.from_numpy(p_helm_np).float(),
+                    person_smoke=torch.from_numpy(p_smoke_np).float(),
+                    detect_boxes=torch.from_numpy(d_boxes_np).float(),
+                    detect_classes=torch.from_numpy(d_cls_np).long(),
+                )
+
+        # ── 普通数据加载 ──
         img_path, lbl_path = self.samples[idx]
         img = cv2.imread(img_path)
         if img is None:
             return self.__getitem__((idx + 1) % len(self))
         h, w = img.shape[:2]
+        p_boxes, p_kpts, p_helm, p_smoke, d_boxes, d_cls = _parse_label(lbl_path, w, h)
 
-        p_boxes, p_kpts, p_helm, p_smoke, d_boxes, d_cls = _parse_label(
-            lbl_path, w, h, self.names)
+        img, scale, (pl, pt) = _letterbox(img, TRAIN_SIZE)
 
-        # letterbox → 640x640
-        scale = TRAIN_SIZE / max(h, w)
-        new_h, new_w = int(h * scale), int(w * scale)
-        img = cv2.resize(img, (new_w, new_h))
-        pad_h = TRAIN_SIZE - new_h
-        pad_w = TRAIN_SIZE - new_w
-        pad_top, pad_left = pad_h // 2, pad_w // 2
-        img = cv2.copyMakeBorder(
-            img, pad_top, pad_h - pad_top, pad_left, pad_w - pad_left,
-            cv2.BORDER_CONSTANT, value=(114, 114, 114))
-        img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        p_boxes_np = p_boxes.numpy() if p_boxes.numel() > 0 else np.empty((0, 4))
+        p_kpts_np = p_kpts.numpy() if p_kpts.numel() > 0 else np.empty((0, 17, 3))
+        d_boxes_np = d_boxes.numpy() if d_boxes.numel() > 0 else np.empty((0, 4))
 
-        def _tx_boxes(b):
-            if b.numel() == 0: return b
-            b = b.clone()
-            b[:, [0, 2]] = b[:, [0, 2]] * scale + pad_left
-            b[:, [1, 3]] = b[:, [1, 3]] * scale + pad_top
-            return b
+        p_boxes_np = _tx_boxes(p_boxes_np, scale, pl, pt)
+        p_kpts_np = _tx_kpts(p_kpts_np, scale, pl, pt)
+        d_boxes_np = _tx_boxes(d_boxes_np, scale, pl, pt)
 
-        def _tx_kpts(k):
-            if k.numel() == 0: return k
-            k = k.clone()
-            k[:, :, 0] = k[:, :, 0] * scale + pad_left
-            k[:, :, 1] = k[:, :, 1] * scale + pad_top
-            return k
+        if self.augment:
+            img = _random_hsv(img)
+            if np.random.random() < 0.5:
+                img = np.ascontiguousarray(img[:, ::-1])
+                nw = img.shape[1]
+                p_boxes_np = _flip_boxes(p_boxes_np, nw)
+                p_kpts_np = _flip_kpts(p_kpts_np, nw)
+                d_boxes_np = _flip_boxes(d_boxes_np, nw)
+
+        img_t = _normalize(img)
 
         return VigilSample(
             image=img_t,
-            person_boxes=_tx_boxes(p_boxes),
-            person_kpts=_tx_kpts(p_kpts),
+            person_boxes=torch.from_numpy(p_boxes_np).float() if len(p_boxes_np) > 0 else torch.empty(0, 4),
+            person_kpts=torch.from_numpy(p_kpts_np).float() if len(p_kpts_np) > 0 else torch.empty(0, 17, 3),
             person_helmet=p_helm,
             person_smoke=p_smoke,
-            detect_boxes=_tx_boxes(d_boxes),
+            detect_boxes=torch.from_numpy(d_boxes_np).float() if len(d_boxes_np) > 0 else torch.empty(0, 4),
             detect_classes=d_cls,
-            dataset_name=self.name,
         )
 
 
@@ -175,29 +339,16 @@ def collate_fn(batch):
     return batch
 
 
-def make_dataloaders(dataset_specs, batch_size=1, augment=True, val_ratio=0.2, verbose=True):
-    train_loaders, val_loaders = {}, {}
+def make_dataloaders(dataset_specs, batch_size=1, augment=True):
+    loaders = {}
     for name, spec in dataset_specs.items():
         path = spec["path"]
         if not os.path.exists(path):
-            if verbose:
-                print(f"  [skip] {name}: {path} not found")
+            print(f"  [skip] {name}: {path} not found")
             continue
-        full_ds = UnifiedDataset(path, name, augment=False)
-        n_total = len(full_ds)
-        n_val = max(1, int(n_total * val_ratio))
-        n_train = n_total - n_val
-        indices = torch.randperm(n_total).tolist()
-        train_ds = UnifiedDataset(path, name, augment=True,
-                                  samples=[full_ds.samples[i] for i in indices[:n_train]])
-        val_ds = UnifiedDataset(path, name, augment=False,
-                                samples=[full_ds.samples[i] for i in indices[n_train:]])
-        train_loaders[name] = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True,
+        ds = UnifiedDataset(path, name, augment=augment)
+        loaders[name] = DataLoader(
+            ds, batch_size=batch_size, shuffle=True,
             collate_fn=collate_fn, num_workers=0, drop_last=True)
-        val_loaders[name] = DataLoader(
-            val_ds, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_fn, num_workers=0, drop_last=True)
-        if verbose:
-            print(f"  [{name}] {n_train} train / {n_val} val samples")
-    return train_loaders, val_loaders
+        print(f"  [{name}] {len(ds)} samples")
+    return loaders

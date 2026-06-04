@@ -55,7 +55,7 @@ class VigilTrainer:
         if sample.detect_boxes.numel() > 0:
             n_d = len(sample.detect_boxes)
             gt_boxes.append(sample.detect_boxes)
-            gt_classes.append((sample.detect_classes + 1).to(self.device))
+            gt_classes.append(sample.detect_classes.to(self.device))
 
         if not gt_boxes:
             return (torch.empty(0, 4, device=self.device),
