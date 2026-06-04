@@ -70,10 +70,11 @@ def main():
 
     # 数据集
     datasets = stage_cfg["datasets"]
+    aug_cfg = cfg.get("augmentation", {})
     val_ratio = train_cfg.get("val_ratio", 0.2)
     print(f"  datasets: {list(datasets.keys())} | val_ratio={val_ratio}")
     train_loaders, val_loaders = make_dataloaders(
-        datasets, batch_size=batch, augment=True, val_ratio=val_ratio, verbose=False)
+        datasets, batch_size=batch, augment=aug_cfg, val_ratio=val_ratio, verbose=False)
     for name, dl in train_loaders.items():
         n_train = len(dl.dataset)
         n_val = len(val_loaders[name].dataset) if name in val_loaders else 0

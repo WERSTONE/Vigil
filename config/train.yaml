@@ -17,6 +17,20 @@ training:
   ema_decay: 0.9999
   amp: true
 
+# ── 数据增强 ──
+augmentation:
+  hsv:
+    enabled: true
+    hgain: 0.015
+    sgain: 0.7
+    vgain: 0.4
+  flip:
+    enabled: true
+    prob: 0.5
+  mosaic:
+    enabled: true
+    prob: 0.5
+
 # ── 损失权重 ──
 loss:
   box: 3.0

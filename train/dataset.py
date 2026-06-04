@@ -227,7 +227,13 @@ class UnifiedDataset(Dataset):
     def __init__(self, root, dataset_name, augment=True):
         self.root = root
         self.name = dataset_name
-        self.augment = augment
+        # augment: bool or dict (config)
+        if isinstance(augment, dict):
+            self.aug_cfg = augment
+            self.augment = True
+        else:
+            self.aug_cfg = {}
+            self.augment = augment
         img_dir = Path(root) / "images"
         lbl_dir = Path(root) / "labels"
         self.samples = []
@@ -243,8 +249,9 @@ class UnifiedDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        # Mosaic (50% 概率, 仅在训练时)
-        if self.augment and np.random.random() < 0.5:
+        # Mosaic
+        mosaic_prob = self.aug_cfg.get("mosaic", {}).get("prob", 0.5) if self.aug_cfg.get("mosaic", {}).get("enabled", True) else 0.0
+        if self.augment and np.random.random() < mosaic_prob:
             indices = [idx] + [np.random.randint(0, len(self)) for _ in range(3)]
             samples = []
             for j in indices:
@@ -276,8 +283,11 @@ class UnifiedDataset(Dataset):
                 d_cls_np = np.concatenate(all_dc) if all_dc else np.empty(0, dtype=np.int64)
 
                 # HSV + flip after mosaic
-                img = _random_hsv(img)
-                if np.random.random() < 0.5:
+                hsv_cfg = self.aug_cfg.get("hsv", {})
+                if hsv_cfg.get("enabled", True):
+                    img = _random_hsv(img, hsv_cfg.get("hgain", 0.015), hsv_cfg.get("sgain", 0.7), hsv_cfg.get("vgain", 0.4))
+                flip_prob = self.aug_cfg.get("flip", {}).get("prob", 0.5) if self.aug_cfg.get("flip", {}).get("enabled", True) else 0.0
+                if np.random.random() < flip_prob:
                     img = np.ascontiguousarray(img[:, ::-1])
                     nw = img.shape[1]
                     p_boxes_np = _flip_boxes(p_boxes_np, nw)
@@ -314,8 +324,11 @@ class UnifiedDataset(Dataset):
         d_boxes_np = _tx_boxes(d_boxes_np, scale, pl, pt)
 
         if self.augment:
-            img = _random_hsv(img)
-            if np.random.random() < 0.5:
+            hsv_cfg = self.aug_cfg.get("hsv", {})
+            if hsv_cfg.get("enabled", True):
+                img = _random_hsv(img, hsv_cfg.get("hgain", 0.015), hsv_cfg.get("sgain", 0.7), hsv_cfg.get("vgain", 0.4))
+            flip_prob = self.aug_cfg.get("flip", {}).get("prob", 0.5) if self.aug_cfg.get("flip", {}).get("enabled", True) else 0.0
+            if np.random.random() < flip_prob:
                 img = np.ascontiguousarray(img[:, ::-1])
                 nw = img.shape[1]
                 p_boxes_np = _flip_boxes(p_boxes_np, nw)
@@ -339,16 +352,16 @@ def collate_fn(batch):
     return batch
 
 
-def make_dataloaders(dataset_specs, batch_size=1, augment=True):
+def make_dataloaders(dataset_specs, batch_size=1, augment=True, verbose=True):
     loaders = {}
     for name, spec in dataset_specs.items():
         path = spec["path"]
         if not os.path.exists(path):
-            print(f"  [skip] {name}: {path} not found")
+            if verbose: print(f"  [skip] {name}: {path} not found")
             continue
         ds = UnifiedDataset(path, name, augment=augment)
         loaders[name] = DataLoader(
             ds, batch_size=batch_size, shuffle=True,
             collate_fn=collate_fn, num_workers=0, drop_last=True)
-        print(f"  [{name}] {len(ds)} samples")
+        if verbose: print(f"  [{name}] {len(ds)} samples")
     return loaders
