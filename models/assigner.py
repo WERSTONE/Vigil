@@ -95,13 +95,15 @@ class CenterAssigner:
                         targets[lvl]["batch_idx"].append(
                             torch.full((len(lvl_cls),), b, dtype=torch.long))
 
-                        # 人体属性
+                        # 人体属性 (mask 对应 all_boxes, 前 n_person 个是 person)
                         k = attrs.get("kpts")
-                        targets[lvl]["gt_kpts"].append(k[mask] if k is not None else None)
+                        n_p = k.shape[0] if k is not None else 0
+                        p_mask = mask[:n_p] if n_p > 0 else mask[:0]
+                        targets[lvl]["gt_kpts"].append(k[p_mask] if k is not None and p_mask.any() else None)
                         hlm = attrs.get("helmet")
-                        targets[lvl]["gt_helmet"].append(hlm[mask] if hlm is not None else None)
+                        targets[lvl]["gt_helmet"].append(hlm[p_mask] if hlm is not None and p_mask.any() else None)
                         smk = attrs.get("smoking")
-                        targets[lvl]["gt_smoking"].append(smk[mask] if smk is not None else None)
+                        targets[lvl]["gt_smoking"].append(smk[p_mask] if smk is not None and p_mask.any() else None)
 
         # 合并每层
         merged = []

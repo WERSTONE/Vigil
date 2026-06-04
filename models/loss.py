@@ -182,13 +182,14 @@ class VigilLoss(nn.Module):
             # ── 人体属性 (仅 person) ──
             person_mask = gt_classes == 0
             if person_mask.any():
-                p_idx_cpu = person_mask.nonzero(as_tuple=True)[0].cpu()
-                p_idx = p_idx_cpu.to(device)
+                n_person = person_mask.sum().item()
+                p_idx = person_mask.nonzero(as_tuple=True)[0].to(device)  # 在 gt_boxes 中的索引
+                p_kpt_idx = torch.arange(n_person)                         # 在 gt_kpts 中的索引 (person-only)
                 p_boxes = gt_boxes[p_idx]
 
                 # 关键点 (OKS)
                 if targets["gt_kpts"] is not None:
-                    gt_k = targets["gt_kpts"][p_idx_cpu].to(device)
+                    gt_k = targets["gt_kpts"][p_kpt_idx].to(device)
                     pk = kpt_p[p_idx].view(-1, 17, 3)
                     plocs = locs[p_idx]
                     pk_xy = pk[..., :2] * stride + plocs.unsqueeze(1)
@@ -206,13 +207,13 @@ class VigilLoss(nn.Module):
 
                 # 头盔 (BCE: target=1 if helmet_on, target=0 if helmet_off)
                 if targets["gt_helmet"] is not None:
-                    gt_h = targets["gt_helmet"][p_idx_cpu].to(device).float()
+                    gt_h = targets["gt_helmet"][p_kpt_idx].to(device).float()
                     loss_helm += F.binary_cross_entropy_with_logits(
                         helm_p[p_idx], 1 - gt_h)
 
                 # 吸烟 (BCE)
                 if targets["gt_smoking"] is not None:
-                    gt_s = targets["gt_smoking"][p_idx_cpu].to(device).float()
+                    gt_s = targets["gt_smoking"][p_kpt_idx].to(device).float()
                     loss_smoke += F.binary_cross_entropy_with_logits(
                         smok_p[p_idx], gt_s)
 

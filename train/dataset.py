@@ -100,22 +100,25 @@ def _parse_label(lbl_path, img_w, img_h, names):
 class UnifiedDataset(Dataset):
     """统一数据集: 所有数据集共用同一解析逻辑."""
 
-    def __init__(self, root, dataset_name, augment=True):
+    def __init__(self, root, dataset_name, augment=True, samples=None):
         self.root = root
         self.name = dataset_name
         self.augment = augment
         self.names = _load_names(root)
 
-        img_dir = Path(root) / "images"
-        lbl_dir = Path(root) / "labels"
-        self.samples = []
-        for img_path in sorted(img_dir.glob("*")):
-            if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
-                continue
-            lbl_path = lbl_dir / (img_path.stem + ".txt")
-            if not lbl_path.exists():
-                lbl_path = lbl_dir / img_path.with_suffix(".txt").name
-            self.samples.append((str(img_path), lbl_path))
+        if samples is not None:
+            self.samples = samples
+        else:
+            img_dir = Path(root) / "images"
+            lbl_dir = Path(root) / "labels"
+            self.samples = []
+            for img_path in sorted(img_dir.glob("*")):
+                if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                    continue
+                lbl_path = lbl_dir / (img_path.stem + ".txt")
+                if not lbl_path.exists():
+                    lbl_path = lbl_dir / img_path.with_suffix(".txt").name
+                self.samples.append((str(img_path), lbl_path))
 
     def __len__(self):
         return len(self.samples)
@@ -172,16 +175,29 @@ def collate_fn(batch):
     return batch
 
 
-def make_dataloaders(dataset_specs, batch_size=1, augment=True):
-    loaders = {}
+def make_dataloaders(dataset_specs, batch_size=1, augment=True, val_ratio=0.2, verbose=True):
+    train_loaders, val_loaders = {}, {}
     for name, spec in dataset_specs.items():
         path = spec["path"]
         if not os.path.exists(path):
-            print(f"  [skip] {name}: {path} not found")
+            if verbose:
+                print(f"  [skip] {name}: {path} not found")
             continue
-        ds = UnifiedDataset(path, name, augment=augment)
-        loaders[name] = DataLoader(
-            ds, batch_size=batch_size, shuffle=True,
+        full_ds = UnifiedDataset(path, name, augment=False)
+        n_total = len(full_ds)
+        n_val = max(1, int(n_total * val_ratio))
+        n_train = n_total - n_val
+        indices = torch.randperm(n_total).tolist()
+        train_ds = UnifiedDataset(path, name, augment=True,
+                                  samples=[full_ds.samples[i] for i in indices[:n_train]])
+        val_ds = UnifiedDataset(path, name, augment=False,
+                                samples=[full_ds.samples[i] for i in indices[n_train:]])
+        train_loaders[name] = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
             collate_fn=collate_fn, num_workers=0, drop_last=True)
-        print(f"  [{name}] {len(ds)} samples")
-    return loaders
+        val_loaders[name] = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            collate_fn=collate_fn, num_workers=0, drop_last=True)
+        if verbose:
+            print(f"  [{name}] {n_train} train / {n_val} val samples")
+    return train_loaders, val_loaders

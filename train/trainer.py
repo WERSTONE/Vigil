@@ -82,6 +82,7 @@ class VigilTrainer:
         iters = {name: iter(dl) for name, dl in loaders.items()}
         done = set()
         step = 0
+        running_detail = defaultdict(float)  # 累计区间内各损失
 
         while len(done) < len(loaders):
             for name, dl_iter in list(iters.items()):
@@ -127,11 +128,19 @@ class VigilTrainer:
                 self.optimizer.step()
 
                 metrics["loss"] += avg_loss.item()
+                for k, v in loss_detail.items():
+                    running_detail[k] += v / len(batch)
                 step += 1
 
                 if step % self.log_interval == 0:
                     pct = step / n_batches * 100
-                    print(f"  [{step}/{n_batches} {pct:.0f}%] loss={avg_loss.item():.4f} lr={lr:.2e}")
+                    parts = [f"loss={avg_loss.item():.4f}"]
+                    for k in ["cls", "bbox", "obj", "kpt", "helmet", "smoke"]:
+                        if k in running_detail:
+                            parts.append(f"{k}={running_detail[k]/self.log_interval:.4f}")
+                    parts.append(f"lr={lr:.2e}")
+                    print(f"  [{step}/{n_batches} {pct:.0f}%] " + " ".join(parts))
+                    running_detail.clear()
 
         for k in metrics:
             metrics[k] /= step
@@ -158,9 +167,12 @@ class VigilTrainer:
                         [attrs] if attrs else [{}], feat_sizes)
 
                     losses = self.loss_fn(head_outs, targets, STRIDES, feat_sizes)
+                    total = 0.0
                     for k, v in losses.items():
                         if isinstance(v, torch.Tensor):
                             metrics["val_" + k] += v.item()
+                            total += v.item()
+                    metrics["val_loss"] += total
                     n += 1
 
         for k in metrics:
@@ -200,9 +212,13 @@ class VigilTrainer:
             log = f"Epoch {epoch+1:3d}/{epochs} | {elapsed:.0f}s | loss={train_m['loss']:.4f}"
             if val_loaders:
                 val_m = self.validate(val_loaders)
-                log += f" val={val_m.get('val_cls',0):.4f}/{val_m.get('val_bbox',0):.4f}/{val_m.get('val_kpt',0):.4f}"
-                if val_m.get("val_cls", 0) < self.best_loss:
-                    self.best_loss = val_m["val_cls"]
+                parts = [f"val={val_m['val_loss']:.4f}"]
+                for k in ["val_cls", "val_bbox", "val_obj", "val_kpt", "val_helmet", "val_smoke"]:
+                    if k in val_m:
+                        parts.append(f"{k[4:]}={val_m[k]:.4f}")
+                log += " | " + " ".join(parts)
+                if val_m["val_loss"] < self.best_loss:
+                    self.best_loss = val_m["val_loss"]
                     self.save(self.save_dir / f"{save_prefix}_best.pt", val_m)
             else:
                 if train_m["loss"] < self.best_loss:
@@ -213,4 +229,4 @@ class VigilTrainer:
                 self.save(self.save_dir / f"{save_prefix}_epoch{epoch+1}.pt")
 
         self.save(self.save_dir / f"{save_prefix}_last.pt")
-        print(f"Best: {self.best_loss:.4f}")
+        print(f"Best val_loss: {self.best_loss:.4f}")

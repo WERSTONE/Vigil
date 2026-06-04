@@ -15,7 +15,7 @@ training:
   warmup_epochs: 1
   grad_clip: 20.0
   ema_decay: 0.9999
-  amp: false
+  amp: true
 
 # ── 损失权重 ──
 loss:
@@ -37,7 +37,7 @@ pretrain:
     water_leak: {path: "data/processed/water_leak"}
   freeze: []
   optimizer:
-    lr: 0.001
+    lr: 0.0005
     weight_decay: 0.0001
     warmup_epochs: 1
   output: "checkpoints/pretrain"
@@ -49,7 +49,7 @@ finetune:
     custom: {path: "data/raw/custom"}
   freeze: ["backbone"]
   optimizer:
-    lr: 0.0001
+    lr: 0.0005
     weight_decay: 0.0001
     warmup_epochs: 1
   pretrained: "checkpoints/pretrain_best.pt"
