@@ -95,15 +95,20 @@ class CenterAssigner:
                         targets[lvl]["batch_idx"].append(
                             torch.full((len(lvl_cls),), b, dtype=torch.long))
 
-                        # 人体属性 (mask 对应 all_boxes, 前 n_person 个是 person)
+                        # 人体属性: person 框在前 n_p 位, mask 选中的 person → kpt 索引
                         k = attrs.get("kpts")
                         n_p = k.shape[0] if k is not None else 0
-                        p_mask = mask[:n_p] if n_p > 0 else mask[:0]
-                        targets[lvl]["gt_kpts"].append(k[p_mask] if k is not None and p_mask.any() else None)
+                        # mask is over ALL boxes at this level, length = K
+                        # person part is mask[:min(n_p, K)], pad to n_p length
+                        K = mask.sum().item()
+                        pm = torch.zeros(n_p, dtype=torch.bool)
+                        end = min(n_p, len(mask))
+                        pm[:end] = mask[:end]
+                        targets[lvl]["gt_kpts"].append(k[pm] if k is not None and pm.any() else None)
                         hlm = attrs.get("helmet")
-                        targets[lvl]["gt_helmet"].append(hlm[p_mask] if hlm is not None and p_mask.any() else None)
+                        targets[lvl]["gt_helmet"].append(hlm[pm] if hlm is not None and pm.any() else None)
                         smk = attrs.get("smoking")
-                        targets[lvl]["gt_smoking"].append(smk[p_mask] if smk is not None and p_mask.any() else None)
+                        targets[lvl]["gt_smoking"].append(smk[pm] if smk is not None and pm.any() else None)
 
         # 合并每层
         merged = []

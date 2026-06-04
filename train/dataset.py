@@ -138,17 +138,14 @@ def _mosaic4(samples, size=640):
         offset_x, offset_y = x1 - (px - x1), y1 - (py - y1)
 
         def _mx_boxes(b, sc, ox, oy):
-            if b is None or len(b) == 0: return b
+            if b is None or len(b) == 0: return b, np.array([], dtype=bool)
             b = b.copy()
             b[:, [0, 2]] = b[:, [0, 2]] * sc + ox
             b[:, [1, 3]] = b[:, [1, 3]] * sc + oy
-            # clip
             b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, size)
             b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, size)
-            # 删除不可见的
-            w_mask = b[:, 2] - b[:, 0] > 2
-            h_mask = b[:, 3] - b[:, 1] > 2
-            return b[w_mask & h_mask]
+            keep = (b[:, 2] - b[:, 0] > 2) & (b[:, 3] - b[:, 1] > 2)
+            return b[keep], keep
 
         def _mx_kpts(k, sc, ox, oy):
             if k is None or len(k) == 0: return k
@@ -157,15 +154,15 @@ def _mosaic4(samples, size=640):
             k[:, :, 1] = k[:, :, 1] * sc + oy
             return k
 
-        pb = _mx_boxes(sample.get("person_boxes"), scale, offset_x, offset_y)
-        db = _mx_boxes(sample.get("detect_boxes"), scale, offset_x, offset_y)
+        pb, pb_keep = _mx_boxes(sample.get("person_boxes"), scale, offset_x, offset_y)
+        db, _ = _mx_boxes(sample.get("detect_boxes"), scale, offset_x, offset_y)
         pk = _mx_kpts(sample.get("person_kpts"), scale, offset_x, offset_y)
 
         if pb is not None and len(pb) > 0:
             all_pb.append(pb)
-            all_pk.append(pk)
-            all_ph.append(sample.get("person_helmet", np.array([])))
-            all_ps.append(sample.get("person_smoke", np.array([])))
+            all_pk.append(pk[pb_keep] if len(pb_keep) == len(pk) else pk)
+            all_ph.append(sample.get("person_helmet", np.array([]))[pb_keep] if len(pb_keep) == len(sample.get("person_helmet", np.array([]))) else sample.get("person_helmet", np.array([])))
+            all_ps.append(sample.get("person_smoke", np.array([]))[pb_keep] if len(pb_keep) == len(sample.get("person_smoke", np.array([]))) else sample.get("person_smoke", np.array([])))
         if db is not None and len(db) > 0:
             all_db.append(db)
             all_dc.append(sample.get("detect_classes", np.array([])))
