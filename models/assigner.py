@@ -62,9 +62,14 @@ class CenterAssigner:
             classes = gt_classes[b]     # [M]
             attrs = gt_attrs[b] if b < len(gt_attrs) else {}
 
+            # 防御: 确保 device 和长度一致
+            if boxes.device != classes.device:
+                classes = classes.to(boxes.device)
+            assert boxes.shape[0] == classes.shape[0], \
+                f"boxes {boxes.shape} vs classes {classes.shape}"
+
             w = boxes[:, 2] - boxes[:, 0]
             h = boxes[:, 3] - boxes[:, 1]
-            # 用 max(w, h) 近似 max(ltrb)，作为尺度代理
             max_side = torch.max(w, h)
             levels = self._get_level(max_side)
 
