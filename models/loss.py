@@ -1,329 +1,228 @@
+"""统一损失: Varifocal cls + WIoU v3 bbox + OKS kpt + BCE attributes."""
+
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List
-import math
 
-from models.head import _make_grid
-from models.assigner import TaskAlignedAssigner
-
+# ── 关键点 OKS sigmas (COCO 17 kpts) ──
 KPT_SIGMAS = torch.tensor([
     0.026, 0.025, 0.025, 0.035, 0.035, 0.079, 0.079, 0.072,
     0.072, 0.062, 0.062, 1.007, 1.007, 0.087, 0.087, 0.089, 0.089,
 ])
 
 
-# ── Focal Loss ──
+def _iou_xyxy(pred, target):
+    """向量化 IoU, pred/target [N, 4] xyxy."""
+    lt = torch.max(pred[:, :2], target[:, :2])
+    rb = torch.min(pred[:, 2:], target[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, 0] * wh[:, 1]
+    area_p = (pred[:, 2] - pred[:, 0]) * (pred[:, 3] - pred[:, 1])
+    area_t = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+    union = area_p + area_t - inter + 1e-16
+    return inter / union, inter, union
 
-def focal_loss(logits, targets, alpha=0.25, gamma=2.0):
-    """Sigmoid + Focal Loss, 自动处理正负样本极度不平衡。
+
+def _wiou_v3_loss(pred_xyxy, target_xyxy, delta=1.5):
+    """WIoU v3: 动态非单调聚焦机制, 抑制低质量 anchor 梯度.
 
     Args:
-        logits: [*] 原始 logits (未经过 sigmoid)
-        targets: [*] 0.0 或 1.0, 与 logits 同 shape
-        alpha: 正样本权重系数 (负样本为 1-alpha)
-        gamma: 聚焦参数, 越大越压制 easy samples
+        pred_xyxy: [N, 4]
+        target_xyxy: [N, 4]
+        delta: 异常度阈值 (default 1.5, 越小越激进)
+
+    Reference: WIoU v3 (arXiv:2301.10051)
     """
-    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    pt = torch.exp(-bce)
-    alpha_t = targets * alpha + (1 - targets) * (1 - alpha)
-    return (alpha_t * (1 - pt) ** gamma * bce).mean()
+    N = pred_xyxy.shape[0]
+    device = pred_xyxy.device
 
+    # 中心点距离 R_WIoU
+    px = (pred_xyxy[:, 0] + pred_xyxy[:, 2]) / 2
+    py = (pred_xyxy[:, 1] + pred_xyxy[:, 3]) / 2
+    tx = (target_xyxy[:, 0] + target_xyxy[:, 2]) / 2
+    ty = (target_xyxy[:, 1] + target_xyxy[:, 3]) / 2
+    # 外接矩形宽高
+    lt_e = torch.min(pred_xyxy[:, :2], target_xyxy[:, :2])
+    rb_e = torch.max(pred_xyxy[:, 2:], target_xyxy[:, 2:])
+    w_e, h_e = (rb_e[:, 0] - lt_e[:, 0]).clamp(min=1e-8), (rb_e[:, 1] - lt_e[:, 1]).clamp(min=1e-8)
+    r_w = torch.exp(((px - tx) ** 2 + (py - ty) ** 2) / (w_e ** 2 + h_e ** 2 + 1e-8))
 
-# ── IoU / CIoU ──
+    # IoU
+    iou, inter, union = _iou_xyxy(pred_xyxy, target_xyxy)
+    liou = 1 - iou  # [N]
 
-def bbox_iou(pred, target, xyxy=True, mode="ciou"):
-    if not xyxy:
-        pred = torch.cat([pred[..., :2] - pred[..., 2:4] / 2,
-                          pred[..., :2] + pred[..., 2:4] / 2], dim=-1)
-        target = torch.cat([target[..., :2] - target[..., 2:4] / 2,
-                            target[..., :2] + target[..., 2:4] / 2], dim=-1)
-    lt = torch.max(pred[..., :2], target[..., :2])
-    rb = torch.min(pred[..., 2:], target[..., 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[..., 0] * wh[..., 1]
-    area_p = (pred[..., 2] - pred[..., 0]) * (pred[..., 3] - pred[..., 1])
-    area_t = (target[..., 2] - target[..., 0]) * (target[..., 3] - target[..., 1])
-    iou = inter / (area_p + area_t - inter + 1e-16)
-    if mode == "iou":
-        return iou
+    # L_WIoU v1
+    l_w1 = r_w * liou
 
-    lt_e = torch.min(pred[..., :2], target[..., :2])
-    rb_e = torch.max(pred[..., 2:], target[..., 2:])
-    wh_e = (rb_e - lt_e).clamp(min=0)
-    c2 = wh_e[..., 0] ** 2 + wh_e[..., 1] ** 2 + 1e-16
-    cp = (pred[..., :2] + pred[..., 2:]) / 2
-    ct = (target[..., :2] + target[..., 2:]) / 2
-    d2 = (cp[..., 0] - ct[..., 0]) ** 2 + (cp[..., 1] - ct[..., 1]) ** 2
-    if mode == "diou":
-        return iou - d2 / c2
-
-    w_p, h_p = pred[..., 2] - pred[..., 0], pred[..., 3] - pred[..., 1]
-    w_t, h_t = target[..., 2] - target[..., 0], target[..., 3] - target[..., 1]
-    v = (4 / (math.pi ** 2)) * ((torch.atan(w_t / (h_t + 1e-16)) -
-                                  torch.atan(w_p / (h_p + 1e-16))) ** 2)
+    # 异常度 β = L*_IoU / mean(L*_IoU)
     with torch.no_grad():
-        alpha = v / (1 - iou + v + 1e-16)
-    return iou - (d2 / c2 + v * alpha)
+        beta = liou / (liou.mean().clamp(min=1e-8) + 1e-8)
+
+    # 非单调聚焦系数 r = β / (δ * α^(β-δ)), 取 α=1.9 (paper recommended)
+    alpha = 1.9
+    r = beta / (delta * (alpha ** (beta - delta)) + 1e-8)
+    r = r.detach()
+
+    return (r * l_w1).mean()
 
 
-# ── 解码辅助 ──
+def _varifocal_loss(pred, target, iou_target, alpha=0.75, gamma=2.0):
+    """Varifocal Loss: IoU-aware 分类损失.
 
-def _decode_preds(cls_list, reg_list, input_size, reg_max=16):
-    """将多尺度 Head 输出解码为扁平预测框和分数。"""
-    all_boxes, all_scores = [], []
-    for cls_t, reg_t in zip(cls_list, reg_list):
-        _, _, H, W = cls_t.shape
-        cls_t = cls_t.permute(0, 2, 3, 1)
-        reg_t = reg_t.permute(0, 2, 3, 1)
+    Args:
+        pred: [N, C] logits
+        target: [N, C] 正样本 soft label (IoU 值), 负样本 0
+        iou_target: [N, C] or None — 目标 IoU (仅正样本非零)
+        alpha: 负样本衰减因子
+        gamma: 聚焦参数
+    """
+    bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+    pt = torch.exp(-bce)
 
-        reg_t = reg_t.view(1, H, W, 4, reg_max).softmax(-1)
-        reg_t = (reg_t @ torch.arange(reg_max, device=reg_t.device, dtype=reg_t.dtype))
+    # 正样本: weight = target (IoU), 聚焦 = (1-pt)^gamma
+    # 负样本: weight = alpha * pt^gamma (降低大量易分负样本的影响)
+    pos_weight = target
+    neg_weight = alpha * pt.pow(gamma)
 
-        grid = _make_grid(W, H, cls_t.device)
-        stride = input_size[0] / W
-        reg_t[..., :2] = (reg_t[..., :2] + grid) * stride
-        reg_t[..., 2:4] = reg_t[..., 2:4] * stride * 2
-
-        cx, cy, w, h = reg_t[..., 0], reg_t[..., 1], reg_t[..., 2], reg_t[..., 3]
-        boxes = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
-        scores = cls_t[..., 0:1].reshape(1, -1).sigmoid()
-
-        all_boxes.append(boxes.reshape(1, -1, 4))
-        all_scores.append(scores)
-
-    return (torch.cat(all_boxes, dim=1)[0],
-            torch.cat(all_scores, dim=1)[0])
+    weight = torch.where(target > 0, pos_weight, neg_weight)
+    return (weight * bce).mean()
 
 
-# ── OKS 关键点损失 ──
+class VigilLoss(nn.Module):
+    """统一多任务损失 (WIoU v3 + Varifocal).
 
-def _oks_loss(pred_kpts, gt_kpts, gt_boxes, fg_mask, matched_gt_idx, kpt_mask=None, eps=1e-8):
-    """计算正样本上的 OKS 损失。pred_kpts: [N, 51], gt_kpts: [M, 17, 3]
-    kpt_mask: [M] bool, 标记哪些 GT 框有有效关键点"""
-    if fg_mask.sum() == 0:
-        return torch.tensor(0.0, device=pred_kpts.device)
+    Args:
+        w_box, w_cls, w_obj, w_kpt, w_helm, w_smoke: 权重
+    """
 
-    sigmas = KPT_SIGMAS.to(pred_kpts.device)
-    p = pred_kpts[fg_mask].view(-1, 17, 3)                  # [P, 17, 3]
-    gt_idx = matched_gt_idx[fg_mask]                         # [P]
-    g = gt_kpts[gt_idx].to(pred_kpts.device)                # [P, 17, 3]
-
-    # 只计算有有效关键点的正样本
-    if kpt_mask is not None:
-        valid = kpt_mask[gt_idx]                            # [P], cpu
-        if not valid.any():
-            return torch.tensor(0.0, device=pred_kpts.device)
-        p, g, gt_idx = p[valid], g[valid], gt_idx[valid]
-
-    gt_w = gt_boxes[gt_idx, 2] - gt_boxes[gt_idx, 0]
-    gt_h = gt_boxes[gt_idx, 3] - gt_boxes[gt_idx, 1]
-    area = (gt_w * gt_h).clamp(min=1).sqrt()                # [P']
-    sigmas = sigmas.view(1, -1)                              # [1, 17]
-
-    d2 = (p[..., :2] - g[..., :2]).pow(2).sum(dim=-1)       # [P', 17]
-    k2 = (2 * sigmas) ** 2 * area.unsqueeze(-1) + eps       # [P', 17]
-    oks = (d2 / (-2 * k2)).exp()
-
-    visible = (g[..., 2] > 0).float()
-    loss = 1 - (oks * visible).sum() / visible.sum().clamp(min=1)
-    return loss
-
-
-# ── BCE Loss ──
-
-class HumanLoss(nn.Module):
-    def __init__(self, box_w=7.5, cls_w=0.5, helmet_w=1.0, smoking_w=1.0, kpt_w=12.0):
+    def __init__(self, w_box=3.0, w_cls=1.0, w_obj=1.0,
+                 w_kpt=5.0, w_helm=1.0, w_smoke=1.0,
+                 kpt_sigmas=None):
         super().__init__()
-        self.box_w, self.cls_w, self.helmet_w, self.smoking_w, self.kpt_w = (
-            box_w, cls_w, helmet_w, smoking_w, kpt_w)
-        self.assigner = TaskAlignedAssigner()
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.w_box = w_box
+        self.w_cls = w_cls
+        self.w_obj = w_obj
+        self.w_kpt = w_kpt
+        self.w_helm = w_helm
+        self.w_smoke = w_smoke
+        self.register_buffer("sigmas",
+            kpt_sigmas if kpt_sigmas is not None else KPT_SIGMAS)
 
-    def forward(self, ha_cls, ha_reg, ha_kpt, targets):
-        """
-        ha_cls:  List[[B,4,Hi,Wi]]  [person, helmet×2, smoking]
-        ha_reg:  List[[B,64,Hi,Wi]]  bbox DFL
-        ha_kpt:  List[[B,51,Hi,Wi]]  17 keypoints
-        targets: {"boxes": [M,4], "helmet": [M]|None, "smoking": [M]|None,
-                   "keypoints": [M,17,3]|None,
-                   "loss_weights": {"box": float, "person": float, ...}}
-        """
-        device = ha_cls[0].device
-        zero = torch.tensor(0.0, device=device)
-        input_size = (ha_cls[0].shape[2] * 4, ha_cls[0].shape[3] * 4)
-        lw = targets.get("loss_weights", {})
+    def forward(self, head_outs, assign_targets, strides, feat_sizes):
+        device = head_outs["cls"][0].device
+        B = head_outs["cls"][0].shape[0]
 
-        losses = {"box": zero, "person": zero, "helmet": zero, "smoking": zero, "kpt": zero}
+        loss_cls = torch.tensor(0.0, device=device)
+        loss_bbox = torch.tensor(0.0, device=device)
+        loss_obj = torch.tensor(0.0, device=device)
+        loss_kpt = torch.tensor(0.0, device=device)
+        loss_helm = torch.tensor(0.0, device=device)
+        loss_smoke = torch.tensor(0.0, device=device)
+        total_pos = 0
 
-        gt_boxes = targets.get("boxes")
-        if gt_boxes is None or len(gt_boxes) == 0:
-            losses["total"] = zero
-            return losses
+        for lvl, (stride, (H, W)) in enumerate(zip(strides, feat_sizes)):
+            targets = assign_targets[lvl]
+            if targets is None:
+                # 无正样本 → 仅计算负样本 obj loss
+                obj_pred = head_outs["obj"][lvl].reshape(B, -1)
+                for b in range(B):
+                    loss_obj += F.binary_cross_entropy_with_logits(
+                        obj_pred[b], torch.zeros(H * W, device=device))
+                continue
 
-        pred_boxes, pred_scores = _decode_preds(ha_cls, ha_reg, input_size)
-        gt_boxes = gt_boxes.to(device)
-        fg_mask, matched_gt_idx, target_boxes = self.assigner(pred_boxes, pred_scores, gt_boxes)
+            N_pos = len(targets["gt_boxes"])
+            total_pos += N_pos
 
-        # Box Loss (CIoU)
-        if lw.get("box", 1.0) > 0 and fg_mask.any():
-            ciou = bbox_iou(pred_boxes[fg_mask], target_boxes[fg_mask], xyxy=True, mode="ciou")
-            losses["box"] = (1 - ciou).mean() * self.box_w
+            grid = targets["grid_xy"].to(device)
+            gt_boxes = targets["gt_boxes"].to(device)
+            gt_classes = targets["gt_classes"].to(device)
+            batch_idx = targets["batch_idx"].to(device)
 
-        # Person Loss (Focal, 全量位置)
-        if lw.get("person", 1.0) > 0:
-            all_scores = torch.cat(
-                [c.permute(0, 2, 3, 1).reshape(-1, 4)[:, 0:1] for c in ha_cls], dim=0)
-            person_targets = torch.zeros(len(all_scores), device=device)
-            if fg_mask.any():
-                person_targets[fg_mask] = 1.0
-            losses["person"] = focal_loss(
-                all_scores.squeeze(-1), person_targets,
-                alpha=0.25, gamma=2.0) * self.cls_w
+            cls_lvl = head_outs["cls"][lvl]
+            reg_lvl = head_outs["bbox"][lvl]
+            obj_lvl = head_outs["obj"][lvl]
+            kpt_lvl = head_outs["kpts"][lvl]
+            helm_lvl = head_outs["helmet"][lvl]
+            smok_lvl = head_outs["smoking"][lvl]
 
-        # Helmet Loss (CE)
-        if lw.get("helmet", 1.0) > 0 and fg_mask.any():
-            gt_helmet = targets.get("helmet")
-            if gt_helmet is not None:
-                helmet_logits = torch.cat(
-                    [c.permute(0, 2, 3, 1).reshape(-1, 4)[:, 1:3] for c in ha_cls], dim=0)
-                gt_h = gt_helmet[matched_gt_idx[fg_mask]].to(device)
-                losses["helmet"] = F.cross_entropy(
-                    helmet_logits[fg_mask], gt_h.long()) * self.helmet_w
+            gx, gy = grid[:, 0], grid[:, 1]
 
-        # Smoking Loss (BCE)
-        if lw.get("smoking", 1.0) > 0 and fg_mask.any():
-            smoking_logits = torch.cat(
-                [c.permute(0, 2, 3, 1).reshape(-1, 4)[:, 3:4] for c in ha_cls], dim=0)
-            gt_smoking = targets.get("smoking")
-            if gt_smoking is not None:
-                gt_s = gt_smoking[matched_gt_idx[fg_mask]].float().to(device)
-            else:
-                gt_s = torch.zeros(fg_mask.sum(), device=device)
-            losses["smoking"] = self.bce(
-                smoking_logits[fg_mask].squeeze(-1), gt_s).mean() * self.smoking_w
+            cls_p = cls_lvl[batch_idx, :, gy, gx]                # [N_pos, 4]
+            reg_p = reg_lvl[batch_idx, :, gy, gx]                # [N_pos, 4]
+            obj_p = obj_lvl[batch_idx, 0, gy, gx]                # [N_pos]
+            kpt_p = kpt_lvl[batch_idx, :, gy, gx]                # [N_pos, 51]
+            helm_p = helm_lvl[batch_idx, 0, gy, gx]              # [N_pos]
+            smok_p = smok_lvl[batch_idx, 0, gy, gx]              # [N_pos]
 
-        # Keypoint Loss (OKS)
-        if lw.get("kpt", 1.0) > 0:
-            if targets.get("keypoints") is not None and fg_mask.any():
-                kpt_flat = torch.cat(
-                    [k.permute(0, 2, 3, 1).reshape(1, -1, 51) for k in ha_kpt], dim=1)[0]
-                losses["kpt"] = _oks_loss(
-                    kpt_flat, targets["keypoints"], gt_boxes, fg_mask, matched_gt_idx,
-                    kpt_mask=targets.get("kpt_mask")) * self.kpt_w
+            # ── 解碼预测框 ──
+            locs = (grid.float() + 0.5) * stride
+            offsets = reg_p.exp() * stride
+            l, t, r, b = offsets[:, 0], offsets[:, 1], offsets[:, 2], offsets[:, 3]
+            pred_xyxy = torch.stack([
+                locs[:, 0] - l, locs[:, 1] - t,
+                locs[:, 0] + r, locs[:, 1] + b,
+            ], dim=-1)
 
-        losses["total"] = (
-            losses["box"] + losses["person"] + losses["helmet"] +
-            losses["smoking"] + losses["kpt"])
-        return losses
+            # ── IoU 计算 (Varifocal 和 WIoU 共用) ──
+            iou, _, _ = _iou_xyxy(pred_xyxy, gt_boxes)
 
+            # ── 分类损失 (Varifocal) ──
+            cls_target = torch.zeros(N_pos, 4, device=device)
+            cls_target[range(N_pos), gt_classes + 1] = iou  # soft label = IoU
+            loss_cls += _varifocal_loss(cls_p, cls_target, cls_target)
 
-class AnomalyLoss(nn.Module):
-    def __init__(self, box_w=7.5, cls_w=1.5, mask_w=1.0):
-        super().__init__()
-        self.box_w, self.cls_w, self.mask_w = box_w, cls_w, mask_w
-        self.assigner = TaskAlignedAssigner()
+            # ── 回归损失 (WIoU v3) ──
+            loss_bbox += _wiou_v3_loss(pred_xyxy, gt_boxes)
 
-    def forward(self, sa_cls, sa_reg, sa_mask, proto, targets):
-        """
-        sa_cls:  List[[B,2,Hi,Wi]]  fire/water
-        sa_reg:  List[[B,64,Hi,Wi]] bbox DFL
-        sa_mask: List[[B,32,Hi,Wi]] mask coefficients
-        proto:   [B,32,160,160]     prototype masks
-        targets: {"boxes": [M,4]|None, "labels": [M]|None, "masks": [M,H,W]|None}
-        """
-        device = sa_cls[0].device
-        zero = torch.tensor(0.0, device=device)
-        input_size = (sa_cls[0].shape[2] * 8, sa_cls[0].shape[3] * 8)
+            # ── Objectness (BCE + IoU 软标签) ──
+            loss_obj += F.binary_cross_entropy_with_logits(
+                obj_p, iou.detach())
 
-        losses = {"box": zero, "cls": zero, "mask": zero}
+            # ── 人体属性 (仅 person) ──
+            person_mask = gt_classes == 0
+            if person_mask.any():
+                p_idx_cpu = person_mask.nonzero(as_tuple=True)[0].cpu()
+                p_idx = p_idx_cpu.to(device)
+                p_boxes = gt_boxes[p_idx]
 
-        gt_boxes = targets.get("boxes")
-        gt_labels = targets.get("labels")
+                # 关键点 (OKS)
+                if targets["gt_kpts"] is not None:
+                    gt_k = targets["gt_kpts"][p_idx_cpu].to(device)
+                    pk = kpt_p[p_idx].view(-1, 17, 3)
+                    plocs = locs[p_idx]
+                    pk_xy = pk[..., :2] * stride + plocs.unsqueeze(1)
+                    gk_xy = gt_k[..., :2]
 
-        if gt_boxes is None or len(gt_boxes) == 0:
-            # 无 GT 标注 → 不贡献 Anomaly 流损失
-            losses["total"] = zero
-            return losses
+                    area = ((p_boxes[:, 2] - p_boxes[:, 0]) *
+                            (p_boxes[:, 3] - p_boxes[:, 1])).clamp(min=1).sqrt()
+                    sigmas = self.sigmas.view(1, 17).to(device)
+                    d2 = (pk_xy - gk_xy).pow(2).sum(dim=-1)
+                    k2 = (2 * sigmas) ** 2 * area.unsqueeze(-1) + 1e-8
+                    oks = (d2 / (-2 * k2)).exp()
+                    visible = (gt_k[..., 2] > 0).float()
+                    n_vis = visible.sum().clamp(min=1)
+                    loss_kpt += (1 - (oks * visible).sum() / n_vis)
 
-        gt_boxes = gt_boxes.to(device)
-        gt_labels = gt_labels.to(device)
+                # 头盔 (BCE: target=1 if helmet_on, target=0 if helmet_off)
+                if targets["gt_helmet"] is not None:
+                    gt_h = targets["gt_helmet"][p_idx_cpu].to(device).float()
+                    loss_helm += F.binary_cross_entropy_with_logits(
+                        helm_p[p_idx], 1 - gt_h)
 
-        # 解码预测 — 取每个位置最大得分类别作为 assign 用分数
-        pred_boxes, _ = _decode_preds(
-            [c[:, :1, :, :] for c in sa_cls], sa_reg, input_size)
-        cls_scores = torch.cat(
-            [c.permute(0, 2, 3, 1).reshape(-1, 2) for c in sa_cls], dim=0)
-        pred_scores = cls_scores.sigmoid().max(dim=-1).values
+                # 吸烟 (BCE)
+                if targets["gt_smoking"] is not None:
+                    gt_s = targets["gt_smoking"][p_idx_cpu].to(device).float()
+                    loss_smoke += F.binary_cross_entropy_with_logits(
+                        smok_p[p_idx], gt_s)
 
-        fg_mask, matched_gt_idx, target_boxes = self.assigner(pred_boxes, pred_scores, gt_boxes)
-
-        # Box Loss
-        if fg_mask.any():
-            ciou = bbox_iou(pred_boxes[fg_mask], target_boxes[fg_mask], xyxy=True, mode="ciou")
-            losses["box"] = (1 - ciou).mean() * self.box_w
-
-        # Classification Loss (Focal, 全量位置, fire/water 非互斥)
-        cls_targets = torch.zeros_like(cls_scores)           # [N, 2]
-        if fg_mask.any():
-            tgt_labels = gt_labels[matched_gt_idx[fg_mask]]
-            cls_targets[fg_mask, tgt_labels] = 1.0
-        losses["cls"] = focal_loss(cls_scores, cls_targets,
-                                   alpha=0.25, gamma=2.0) * self.cls_w
-
-        # Mask Loss (BCE, 暂不启用 — 需 GT 掩码标注)
-        gt_masks = targets.get("masks")
-        if gt_masks is not None and fg_mask.any() and proto is not None:
-            coeffs = torch.cat(
-                [m.permute(0, 2, 3, 1).reshape(1, -1, 32) for m in sa_mask], dim=1)[0]
-            pred_masks = (coeffs[fg_mask] @ proto[0].view(32, -1)).sigmoid()
-            gt_m = gt_masks[matched_gt_idx[fg_mask]].view(pred_masks.shape[0], -1).to(device)
-            losses["mask"] = self.bce(pred_masks, gt_m).mean() * self.mask_w
-
-        losses["total"] = losses["box"] + losses["cls"] + losses["mask"]
-        return losses
-
-
-class UncertaintyWeighting(nn.Module):
-    """Kendall et al. 2018: L = Σ(1/(2σ²)·L_i + log σ)"""
-    def __init__(self, n_tasks=2, init_std=1.0):
-        super().__init__()
-        self.log_var = nn.Parameter(torch.ones(n_tasks) * math.log(init_std ** 2))
-
-    def forward(self, losses):
-        total = 0.0
-        for i, loss in enumerate(losses):
-            precision = torch.exp(-self.log_var[i])
-            total += precision * loss + self.log_var[i]
-        return total * 0.5
-
-
-class VigilMultiTaskLoss(nn.Module):
-    def __init__(self, human_loss=None, anomaly_loss=None, balance="manual",
-                 h_w=1.0, a_w=0.5):
-        super().__init__()
-        self.human_loss = human_loss or HumanLoss()
-        self.anomaly_loss = anomaly_loss or AnomalyLoss()
-        self.balance = balance
-        self.balancer = UncertaintyWeighting(2) if balance == "uncertainty" else None
-        self.h_w, self.a_w = h_w, a_w
-
-    def forward(self, outputs, targets):
-        hl = self.human_loss(
-            outputs["ha_cls"], outputs["ha_reg"], outputs["ha_kpt"],
-            targets.get("human", {}))
-        al = self.anomaly_loss(
-            outputs["sa_cls"], outputs["sa_reg"], outputs["sa_mask"],
-            outputs["proto"], targets.get("anomaly", {}))
-
-        if self.balancer:
-            total = self.balancer([hl["total"], al["total"]])
-        else:
-            total = self.h_w * hl["total"] + self.a_w * al["total"]
-
-        return {"total": total,
-                "human_total": hl["total"], "anomaly_total": al["total"],
-                "human_box": hl["box"], "human_helmet": hl["helmet"],
-                "human_smoking": hl["smoking"], "human_kpt": hl["kpt"],
-                "anomaly_box": al["box"], "anomaly_cls": al["cls"],
-                "anomaly_mask": al["mask"]}
+        num_imgs = max(B, 1)
+        return {
+            "cls":    self.w_cls   * loss_cls / num_imgs,
+            "bbox":   self.w_box   * loss_bbox / num_imgs,
+            "obj":    self.w_obj   * loss_obj / num_imgs,
+            "kpt":    self.w_kpt   * (loss_kpt / max(total_pos, 1)),
+            "helmet": self.w_helm  * (loss_helm / max(total_pos, 1)),
+            "smoke":  self.w_smoke * (loss_smoke / max(total_pos, 1)),
+            "num_pos": total_pos,
+        }

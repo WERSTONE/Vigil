@@ -1,10 +1,11 @@
 """
 时序后处理 — 跌倒(≥5s) + 挥手(≥2s) + 闯入/安全帽/越界/烟火/漏水事件生成
+接受 InferenceEngine 产出的 PersonResult / AnomalyResult (duck typing).
 """
 import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any
 import time
 
 

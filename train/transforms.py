@@ -1,15 +1,19 @@
+"""数据增强: letterbox + HSV + flip + normalize."""
+
 import cv2
 import numpy as np
 import torch
-from typing import List, Tuple, Optional
-
 
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# COCO 17 点水平翻转交换对: (L, R)
+KPT_FLIP_PAIRS = [(0, 0), (1, 2), (3, 4), (5, 6), (7, 8), (9, 10),
+                   (11, 12), (13, 14), (15, 16)]
 
 
 def letterbox(img, target_size=640, fill=114):
-    """等比缩放 + 填充到固定 target_size × target_size。"""
+    """等比缩放 + 居中填充."""
     h, w = img.shape[:2]
     r = target_size / max(h, w)
     new_w, new_h = int(w * r), int(h * r)
@@ -18,12 +22,13 @@ def letterbox(img, target_size=640, fill=114):
     dh = target_size - new_h
     top, bottom = dh // 2, dh - dh // 2
     left, right = dw // 2, dw - dw // 2
-    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(fill, fill, fill))
+    img = cv2.copyMakeBorder(img, top, bottom, left, right,
+                              cv2.BORDER_CONSTANT, value=(fill, fill, fill))
     return img, r, (left, top)
 
 
 def random_hsv(img, hgain=0.015, sgain=0.7, vgain=0.4):
-    """HSV 随机扰动，增加颜色不变性。"""
+    """HSV 随机扰动."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
     rng = np.random
     hsv[..., 0] = (hsv[..., 0] + rng.uniform(-1, 1) * hgain * 180) % 360
@@ -33,95 +38,109 @@ def random_hsv(img, hgain=0.015, sgain=0.7, vgain=0.4):
     return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
-def random_flip_lr(img, bboxes, prob=0.5):
-    """随机水平翻转图像和 bbox。"""
-    if np.random.random() > prob:
-        return img, bboxes
-    img = np.ascontiguousarray(img[:, ::-1])
-    w = img.shape[1]
-    for b in bboxes:
-        x1, x2 = b[0], b[2]
-        b[0], b[2] = w - x2, w - x1
-    return img, bboxes
-
-
 def normalize(img):
-    """归一化 → [C,H,W] tensor，值域约 [-2, 2]。"""
+    """归一化 → [C,H,W] tensor."""
     img = img.astype(np.float32) / 255.0
     img = (img - MEAN) / STD
     return torch.from_numpy(img.transpose(2, 0, 1))
 
 
-def adjust_bboxes(bboxes, scale, pad):
-    """将原始坐标映射到 letterbox 后的坐标。"""
-    out = []
-    for b in bboxes:
-        b = [v * scale + pad[i % 2] for i, v in enumerate(b)]
-        out.append(b)
-    return out
+def _adjust_boxes(boxes, scale, pad_l, pad_t):
+    """原始坐标 → letterbox 坐标."""
+    for b in boxes:
+        b[0] = b[0] * scale + pad_l
+        b[1] = b[1] * scale + pad_t
+        b[2] = b[2] * scale + pad_l
+        b[3] = b[3] * scale + pad_t
 
 
-def adjust_keypoints(keypoints, scale, pad):
-    """将原始关键点坐标映射到 letterbox 后的坐标。"""
-    out = []
+def _adjust_keypoints(keypoints, scale, pad_l, pad_t):
+    """原始关键点 → letterbox 坐标."""
     for kpts in keypoints:
-        adj = []
-        for kx, ky, kv in kpts:
-            adj.append([kx * scale + pad[0], ky * scale + pad[1], kv])
-        out.append(adj)
-    return out
+        for kp in kpts:
+            kp[0] = kp[0] * scale + pad_l
+            kp[1] = kp[1] * scale + pad_t
+
+
+def _flip_boxes(boxes, img_w):
+    """水平翻转 bbox."""
+    for b in boxes:
+        b[0], b[2] = img_w - b[2], img_w - b[0]
+
+
+def _flip_keypoints(keypoints, img_w):
+    """水平翻转关键点 — 交换 x 坐标 AND 交换左右配对."""
+    for kpts in keypoints:
+        for kp in kpts:
+            kp[0] = img_w - kp[0]
+        # 交换左右配对 (如左肩↔右肩)
+        for l_idx, r_idx in KPT_FLIP_PAIRS:
+            if l_idx != r_idx and l_idx < len(kpts) and r_idx < len(kpts):
+                kpts[l_idx], kpts[r_idx] = kpts[r_idx].copy(), kpts[l_idx].copy()
 
 
 class TrainTransform:
-    def __init__(self, input_size=640, hsv_cfg=None, flip_prob=0.5):
+    def __init__(self, input_size=640, flip_prob=0.5,
+                 hsv_cfg=None):
         self.size = input_size
-        self.hsv = hsv_cfg or {}
         self.flip_prob = flip_prob
+        self.hsv_cfg = hsv_cfg or {}
 
-    def __call__(self, img, human_boxes, human_kpts, anomaly_boxes, head_boxes=None):
-        img, scale, pad = letterbox(img, self.size)
+    def __call__(self, img, person_boxes=None, person_kpts=None,
+                 helmet_boxes=None, smoking_boxes=None, anomaly_boxes=None,
+                 cached_meta=None):
+        """cached_meta: (scale, pad_l, pad_t) — 非 None 则跳过 letterbox, 直接调整坐标."""
+        if cached_meta is not None:
+            scale, pad_l, pad_t = cached_meta
+        else:
+            img, scale, (pad_l, pad_t) = letterbox(img, self.size)
 
-        if human_boxes:
-            human_boxes = adjust_bboxes(human_boxes, scale, pad)
-        if human_kpts:
-            human_kpts = adjust_keypoints(human_kpts, scale, pad)
-        if anomaly_boxes:
-            anomaly_boxes = adjust_bboxes(anomaly_boxes, scale, pad)
-        if head_boxes:
-            head_boxes = adjust_bboxes(head_boxes, scale, pad)
+        all_boxes = {
+            "person": person_boxes or [],
+            "helmet": helmet_boxes or [],
+            "smoking": smoking_boxes or [],
+            "anomaly": anomaly_boxes or [],
+        }
+        all_kpts = {"person": person_kpts or []}
 
-        img = random_hsv(img, **self.hsv)
+        for boxes in all_boxes.values():
+            if boxes:
+                _adjust_boxes(boxes, scale, pad_l, pad_t)
+        for kpts in all_kpts.values():
+            if kpts:
+                _adjust_keypoints(kpts, scale, pad_l, pad_t)
 
-        # flip 必须统一: person 和 head 同一次随机决定
-        do_flip = np.random.random() < self.flip_prob
-        if do_flip:
+        img = random_hsv(img, **self.hsv_cfg)
+
+        if np.random.random() < self.flip_prob:
             img = np.ascontiguousarray(img[:, ::-1])
             w = img.shape[1]
-            if human_boxes:
-                for b in human_boxes:
-                    b[0], b[2] = w - b[2], w - b[0]
-            if anomaly_boxes:
-                for b in anomaly_boxes:
-                    b[0], b[2] = w - b[2], w - b[0]
-            if head_boxes:
-                for b in head_boxes:
-                    b[0], b[2] = w - b[2], w - b[0]
+            for boxes in all_boxes.values():
+                if boxes:
+                    _flip_boxes(boxes, w)
+            for kpts in all_kpts.values():
+                if kpts:
+                    _flip_keypoints(kpts, w)
 
-        return normalize(img), human_boxes, human_kpts, anomaly_boxes, head_boxes
+        return (normalize(img),
+                all_boxes["person"], all_kpts["person"],
+                all_boxes["helmet"], all_boxes["smoking"],
+                all_boxes["anomaly"])
 
 
 class ValTransform:
     def __init__(self, input_size=640):
         self.size = input_size
 
-    def __call__(self, img, human_boxes, human_kpts, anomaly_boxes, head_boxes=None):
-        img, scale, pad = letterbox(img, self.size)
-        if human_boxes:
-            human_boxes = adjust_bboxes(human_boxes, scale, pad)
-        if human_kpts:
-            human_kpts = adjust_keypoints(human_kpts, scale, pad)
-        if anomaly_boxes:
-            anomaly_boxes = adjust_bboxes(anomaly_boxes, scale, pad)
-        if head_boxes:
-            head_boxes = adjust_bboxes(head_boxes, scale, pad)
-        return normalize(img), human_boxes, human_kpts, anomaly_boxes, head_boxes
+    def __call__(self, img, person_boxes=None, person_kpts=None,
+                 helmet_boxes=None, smoking_boxes=None, anomaly_boxes=None):
+        img, scale, (pad_l, pad_t) = letterbox(img, self.size)
+        for boxes in [person_boxes, helmet_boxes, smoking_boxes, anomaly_boxes]:
+            if boxes:
+                _adjust_boxes(boxes, scale, pad_l, pad_t)
+        if person_kpts:
+            _adjust_keypoints(person_kpts, scale, pad_l, pad_t)
+        return (normalize(img),
+                person_boxes or [], person_kpts or [],
+                helmet_boxes or [], smoking_boxes or [],
+                anomaly_boxes or [])

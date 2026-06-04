@@ -1,66 +1,125 @@
+"""中心点分配器: GT → FPN 层级 → 格点."""
+
 import torch
-import torch.nn as nn
 
 
-def box_iou(boxes1, boxes2):
-    """向量化 IoU [M,4] × [N,4] → [M,N]"""
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
-    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1]
-    return inter / (area1[:, None] + area2 - inter + 1e-16)
+class CenterAssigner:
+    """FCOS-style 中心点分配.
 
-
-class TaskAlignedAssigner(nn.Module):
+    分配规则:
+        - GT 中心落在格点 radius 范围内 → 正样本
+        - 不同尺度 GT 分配到不同 FPN 层级 (按 max(l,t,r,b))
+        - 返回每层的正样本索引用于损失计算
     """
-    YOLOv8-style TaskAlignedAssigner.
-    对每个 GT 框，综合 cls_score 和 IoU 选出最匹配的预测作为正样本。
-    """
-    def __init__(self, topk=13, eps=1e-9):
-        super().__init__()
-        self.topk = topk
-        self.eps = eps
 
-    @torch.no_grad()
-    def forward(self, pred_boxes, pred_scores, gt_boxes):
+    def __init__(self, strides, radius=1.5):
+        self.strides = strides
+        self.radius = radius
+        self.num_levels = len(strides)
+        # 各层级负责的 ltrb 范围 (原图像素)
+        # P2 负责 0~64, P3 负责 64~128, ...
+        self.level_ranges = []
+        for i, s in enumerate(strides):
+            if i == 0:
+                self.level_ranges.append((0, s * 8))
+            else:
+                self.level_ranges.append(
+                    (strides[i-1] * 8, s * 8))
+
+    def _get_level(self, ltrb_max):
+        """根据 max(l,t,r,b) 选择 FPN 层级."""
+        level = torch.zeros_like(ltrb_max, dtype=torch.long)
+        for i, (lo, hi) in enumerate(self.level_ranges):
+            if i == self.num_levels - 1:
+                level[ltrb_max >= lo] = i
+            else:
+                level[(ltrb_max >= lo) & (ltrb_max < hi)] = i
+        return level
+
+    def __call__(self, gt_boxes, gt_classes, gt_attrs, feat_sizes):
         """
-        pred_boxes: [N, 4]  xyxy, 所有尺度拼接后的预测框
-        pred_scores: [N]     person confidence (已 sigmoid)
-        gt_boxes: [M, 4]    GT 框 xyxy
+        Args:
+            gt_boxes:   List[[M_i, 4]]      xyxy 像素坐标
+            gt_classes: List[[M_i]]          0=person, 1=fire, 2=water
+            gt_attrs:   List[dict]           kpts/helmet/smoking (可为 None)
+            feat_sizes: List[(H, W)]         各 FPN 层特征图尺寸
 
         Returns:
-            fg_mask: [N]         正样本 mask
-            matched_gt_idx: [N]  每个正样本对应的 GT 索引 (负样本为 -1)
-            target_boxes: [N, 4] 分配的目标框 (负样本为零)
+            targets_per_level: List[dict or None], 每层包含:
+                grid_xy, gt_boxes, gt_classes, gt_kpts, gt_helmet, gt_smoking, batch_idx
         """
-        N, M = pred_boxes.shape[0], gt_boxes.shape[0]
+        B = len(gt_boxes)
+        targets = [{
+            "grid_xy": [], "gt_boxes": [], "gt_classes": [],
+            "gt_kpts": [], "gt_helmet": [], "gt_smoking": [], "batch_idx": [],
+        } for _ in range(self.num_levels)]
 
-        fg_mask = torch.zeros(N, dtype=torch.bool)
-        matched_gt_idx = torch.full((N,), -1, dtype=torch.long)
-        target_boxes = torch.zeros_like(pred_boxes)
+        for b in range(B):
+            if len(gt_boxes[b]) == 0:
+                continue
 
-        if M == 0:
-            return fg_mask, matched_gt_idx, target_boxes
+            boxes = gt_boxes[b]        # [M, 4]
+            classes = gt_classes[b]     # [M]
+            attrs = gt_attrs[b] if b < len(gt_attrs) else {}
 
-        ious = box_iou(gt_boxes, pred_boxes)                     # [M, N]
-        topk_iou, topk_idx = ious.topk(min(self.topk, N), dim=1) # [M, topk]
+            w = boxes[:, 2] - boxes[:, 0]
+            h = boxes[:, 3] - boxes[:, 1]
+            # 用 max(w, h) 近似 max(ltrb)，作为尺度代理
+            max_side = torch.max(w, h)
+            levels = self._get_level(max_side)
 
-        topk_scores = pred_scores[topk_idx]                      # [M, topk]
-        align_metrics = (topk_scores * topk_iou).sqrt()          # [M, topk]
-        threshold = align_metrics.mean()                         # 动态阈值
-
-        for gt_i in range(M):
-            mask = align_metrics[gt_i] > threshold
-            for k in range(topk_idx.shape[1]):
-                if not mask[k]:
+            for lvl in range(self.num_levels):
+                mask = levels == lvl
+                if not mask.any():
                     continue
-                pred_i = topk_idx[gt_i, k].item()
-                if fg_mask[pred_i]:
-                    continue  # 已被其他 GT 占用
-                fg_mask[pred_i] = True
-                matched_gt_idx[pred_i] = gt_i
-                target_boxes[pred_i] = gt_boxes[gt_i]
 
-        return fg_mask, matched_gt_idx, target_boxes
+                lvl_boxes = boxes[mask]       # [K, 4]
+                lvl_cls = classes[mask]        # [K]
+                H, W = feat_sizes[lvl]
+                stride = self.strides[lvl]
+
+                # 中心点 → 格点
+                cx = (lvl_boxes[:, 0] + lvl_boxes[:, 2]) / 2 / stride
+                cy = (lvl_boxes[:, 1] + lvl_boxes[:, 3]) / 2 / stride
+                gx = cx.floor().long().clamp(0, W - 1)
+                gy = cy.floor().long().clamp(0, H - 1)
+
+                for dx in range(-int(self.radius), int(self.radius) + 1):
+                    for dy in range(-int(self.radius), int(self.radius) + 1):
+                        nx = (gx + dx).clamp(0, W - 1)
+                        ny = (gy + dy).clamp(0, H - 1)
+
+                        targets[lvl]["grid_xy"].append(torch.stack([nx, ny], dim=1))
+                        targets[lvl]["gt_boxes"].append(lvl_boxes)
+                        targets[lvl]["gt_classes"].append(lvl_cls)
+                        targets[lvl]["batch_idx"].append(
+                            torch.full((len(lvl_cls),), b, dtype=torch.long))
+
+                        # 人体属性
+                        k = attrs.get("kpts")
+                        targets[lvl]["gt_kpts"].append(k[mask] if k is not None else None)
+                        hlm = attrs.get("helmet")
+                        targets[lvl]["gt_helmet"].append(hlm[mask] if hlm is not None else None)
+                        smk = attrs.get("smoking")
+                        targets[lvl]["gt_smoking"].append(smk[mask] if smk is not None else None)
+
+        # 合并每层
+        merged = []
+        for lvl in range(self.num_levels):
+            t = targets[lvl]
+            if len(t["grid_xy"]) == 0:
+                merged.append(None)
+                continue
+            merged.append({
+                "grid_xy": torch.cat(t["grid_xy"], dim=0),
+                "gt_boxes": torch.cat(t["gt_boxes"], dim=0),
+                "gt_classes": torch.cat(t["gt_classes"], dim=0),
+                "gt_kpts": torch.cat([x for x in t["gt_kpts"] if x is not None], dim=0)
+                    if any(x is not None for x in t["gt_kpts"]) else None,
+                "gt_helmet": torch.cat([x for x in t["gt_helmet"] if x is not None], dim=0)
+                    if any(x is not None for x in t["gt_helmet"]) else None,
+                "gt_smoking": torch.cat([x for x in t["gt_smoking"] if x is not None], dim=0)
+                    if any(x is not None for x in t["gt_smoking"]) else None,
+                "batch_idx": torch.cat(t["batch_idx"], dim=0),
+            })
+        return merged

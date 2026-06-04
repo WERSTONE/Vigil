@@ -36,4 +36,8 @@ checkpoints/
 target.xlsx
 CLAUDE.md
 test.mp4
-data
+*.pt
+data/raw/
+data/backups/
+data/viz_kpts/
+data/viz_final/

@@ -1,225 +1,154 @@
+"""统一检测头: cls + bbox + kpts + helmet + smoking, 权重跨尺度共享."""
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import List
-from dataclasses import dataclass
 from models.common import Conv
 
 
-# ── 任务头 ──
+class VigilHead(nn.Module):
+    """FCOS-style 统一检测头, 每个格点输出所有属性.
 
-class HumanAnalysisHead(nn.Module):
-    """Person detect + attributes + keypoints. One anchor predicts [bbox(4)+person(1)+helmet(2)+smoking(1)+kpts(51)]."""
-    def __init__(self, in_channels, num_keypoints=17, reg_max=16):
+    输出 (per FPN level):
+        cls:     [B, num_cls, H, W]   — 4 类 (bg/person/fire/water)
+        bbox:    [B, 4, H, W]        — ltrb offset (正值)
+        obj:     [B, 1, H, W]        — centerness
+        kpts:    [B, 51, H, W]       — 17关键点 × (dx, dy, vis)
+        helmet:  [B, 1, H, W]        — 戴安全帽 logit
+        smoking: [B, 1, H, W]        — smoking logit
+    """
+
+    def __init__(self, in_ch, num_classes=4, num_kpts=17, num_tower=2):
         super().__init__()
-        attr_dim = 4  # person + helmet(on/off) + smoking
-        self.cls_preds = nn.ModuleList([nn.Conv2d(c, attr_dim, 1) for c in in_channels])
-        self.reg_preds = nn.ModuleList([nn.Conv2d(c, 4 * reg_max, 1) for c in in_channels])
-        self.kpt_preds = nn.ModuleList([nn.Conv2d(c, num_keypoints * 3, 1) for c in in_channels])
+        self.num_classes = num_classes
+        self.num_kpts = num_kpts
+
+        # 分类塔
+        cls_tower = [Conv(in_ch, in_ch, 3) for _ in range(num_tower)]
+        self.cls_tower = nn.Sequential(*cls_tower)
+        self.cls_pred = nn.Conv2d(in_ch, num_classes, 1)
+
+        # 回归塔
+        reg_tower = [Conv(in_ch, in_ch, 3) for _ in range(num_tower)]
+        self.reg_tower = nn.Sequential(*reg_tower)
+        self.reg_pred = nn.Conv2d(in_ch, 4, 1)
+        self.obj_pred = nn.Conv2d(in_ch, 1, 1)
+
+        # 人体属性塔 (共享)
+        attr_tower = [Conv(in_ch, in_ch, 3) for _ in range(num_tower)]
+        self.attr_tower = nn.Sequential(*attr_tower)
+        self.kpt_pred = nn.Conv2d(in_ch, num_kpts * 3, 1)
+        self.helmet_pred = nn.Conv2d(in_ch, 1, 1)
+        self.smoke_pred = nn.Conv2d(in_ch, 1, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        # Focal Loss prior: pi = 0.01 → bias = -4.595
+        nn.init.constant_(self.cls_pred.bias, -4.595)
 
     def forward(self, features):
-        cls_outs, reg_outs, kpt_outs = [], [], []
-        for f, cl, rl, kl in zip(features, self.cls_preds, self.reg_preds, self.kpt_preds):
-            cls_outs.append(cl(f))
-            reg_outs.append(rl(f))
-            kpt_outs.append(kl(f))
-        return cls_outs, reg_outs, kpt_outs
+        """features: List[[B, C, H, W]] from neck.
 
+        Returns dict with keys: cls, bbox, obj, kpts, helmet, smoking.
+        Each value is a List[Tensor] per level.
+        """
+        outs = {"cls": [], "bbox": [], "obj": [],
+                "kpts": [], "helmet": [], "smoking": []}
+        for f in features:
+            outs["cls"].append(self.cls_pred(self.cls_tower(f)))
+            outs["bbox"].append(self.reg_pred(self.reg_tower(f)))
+            outs["obj"].append(self.obj_pred(self.reg_tower(f)))
 
-class SceneAnomalyHead(nn.Module):
-    """Anomaly detect + mask coeffs. [bbox(4)+cls(2:fire/water)+mask(32)]."""
-    def __init__(self, in_channels, num_classes=2, mask_dim=32, reg_max=16):
-        super().__init__()
-        self.cls_preds = nn.ModuleList([nn.Conv2d(c, num_classes, 1) for c in in_channels])
-        self.reg_preds = nn.ModuleList([nn.Conv2d(c, 4 * reg_max, 1) for c in in_channels])
-        self.mask_preds = nn.ModuleList([nn.Conv2d(c, mask_dim, 1) for c in in_channels])
-
-    def forward(self, features):
-        cls_outs, reg_outs, mask_outs = [], [], []
-        for f, cl, rl, ml in zip(features, self.cls_preds, self.reg_preds, self.mask_preds):
-            cls_outs.append(cl(f))
-            reg_outs.append(rl(f))
-            mask_outs.append(ml(f))
-        return cls_outs, reg_outs, mask_outs
-
-
-class ProtoBranch(nn.Module):
-    """YOLACT-style prototype masks. N3(80x80)->up->[32,160,160]."""
-    def __init__(self, in_ch=64, proto_dim=32):
-        super().__init__()
-        self.net = nn.Sequential(
-            Conv(in_ch, in_ch, 3), Conv(in_ch, in_ch, 3), Conv(in_ch, in_ch, 3),
-            nn.Conv2d(in_ch, proto_dim, 1),
-        )
-
-    def forward(self, x):
-        return F.interpolate(self.net(x), scale_factor=2.0, mode="bilinear", align_corners=False)
+            attr = self.attr_tower(f)
+            outs["kpts"].append(self.kpt_pred(attr))
+            outs["helmet"].append(self.helmet_pred(attr))
+            outs["smoking"].append(self.smoke_pred(attr))
+        return outs
 
 
 # ── 解码 ──
 
-@dataclass
-class DecodedPerson:
-    bbox: List[float]
-    confidence: float
-    helmet_status: int          # 0=on, 1=off
-    helmet_conf: float
-    smoking_conf: float
-    keypoints: List             # [17,3]
-
-
-@dataclass
-class DecodedAnomaly:
-    bbox: List[float]
-    class_id: int               # 0=fire, 1=water
-    class_name: str
-    confidence: float
-    mask_coeffs: List[float]    # [32]
-
-
 def _make_grid(nx, ny, device):
-    yv, xv = torch.meshgrid(torch.arange(ny, device=device), torch.arange(nx, device=device), indexing="ij")
+    yv, xv = torch.meshgrid(
+        torch.arange(ny, device=device),
+        torch.arange(nx, device=device), indexing="ij")
     return torch.stack((xv, yv), 2).float()
 
 
-def _box_iou_batch(boxes1, boxes2):
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
-    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1]
-    return inter / (area1[:, None] + area2 - inter + 1e-16)
+def decode_outputs(head_outs, strides, score_thresh=0.05):
+    """将多级 head 输出解码为检测结果.
 
+    Args:
+        head_outs: dict with cls/bbox/obj/kpts/helmet/smoking (each List[Tensor])
+        strides: 各级 stride 列表
+        score_thresh: 初始分数阈值
 
-def decode_human_outputs(ha_cls, ha_reg, ha_kpt, input_shape, conf_threshold=0.25, iou_threshold=0.45, reg_max=16):
-    all_bboxes, all_confs, all_helmets, all_smokings, all_kpts = [], [], [], [], []
+    Returns:
+        boxes:    [B, N, 4]  xyxy
+        scores:   [B, N]
+        classes:  [B, N]  int (0=person, 1=fire, 2=water)
+        kpts:     [B, N, 17, 3]  xyv
+        helmet:   [B, N]     logits
+        smoking:  [B, N]     logits
+    """
+    B = head_outs["cls"][0].shape[0]
+    device = head_outs["cls"][0].device
+    all_boxes, all_scores, all_cls = [], [], []
+    all_kpts, all_helmet, all_smoke = [], [], []
 
-    for cls_t, reg_t, kpt_t in zip(ha_cls, ha_reg, ha_kpt):
-        B, _, H, W = cls_t.shape
-        cls_t = cls_t.permute(0, 2, 3, 1)
-        reg_t = reg_t.permute(0, 2, 3, 1)
-        kpt_t = kpt_t.permute(0, 2, 3, 1)
+    for lvl, stride in enumerate(strides):
+        cls_t = head_outs["cls"][lvl].permute(0, 2, 3, 1).reshape(B, -1, 4)       # [B, N, 4]
+        reg_t = head_outs["bbox"][lvl].permute(0, 2, 3, 1).reshape(B, -1, 4)       # [B, N, 4]
+        obj_t = head_outs["obj"][lvl].permute(0, 2, 3, 1).reshape(B, -1, 1)        # [B, N, 1]
+        _, _, H, W = head_outs["cls"][lvl].shape
 
-        reg_t = reg_t.view(B, H, W, 4, reg_max).softmax(-1)
-        reg_t = (reg_t @ torch.arange(reg_max, device=reg_t.device, dtype=reg_t.dtype))
+        # 网格坐标
+        grid = _make_grid(W, H, device)               # [H, W, 2]
+        locs = grid.reshape(1, -1, 2) * stride        # [1, N, 2]
 
-        grid = _make_grid(W, H, cls_t.device)
-        stride = input_shape[0] / W
-        reg_t[..., :2] = (reg_t[..., :2] + grid) * stride
-        reg_t[..., 2:4] = reg_t[..., 2:4] * stride * 2
+        # ltrb offset → xyxy
+        offsets = reg_t.exp() * stride                 # [B, N, 4]
+        l, t, r, b = offsets[..., 0], offsets[..., 1], offsets[..., 2], offsets[..., 3]
+        x1 = locs[..., 0] - l
+        y1 = locs[..., 1] - t
+        x2 = locs[..., 0] + r
+        y2 = locs[..., 1] + b
+        boxes = torch.stack([x1, y1, x2, y2], dim=-1)
 
-        cx, cy, w, h = reg_t[..., 0], reg_t[..., 1], reg_t[..., 2], reg_t[..., 3]
-        bboxes = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
+        # 分数: cls_sigmoid * centerness
+        scores = cls_t.sigmoid() * obj_t.sigmoid()     # [B, N, 4]
+        # 跳过 bg (class 0), 只保留 person/fire/water
+        scores = scores[:, :, 1:]                      # [B, N, 3]
+        cls_idx = torch.arange(1, 4, device=device).reshape(1, 1, -1).expand(B, scores.shape[1], -1)
 
-        kpt_flat = kpt_t.reshape(B, -1, 51)
-        kpt_flat[..., 0::3] *= stride
-        kpt_flat[..., 1::3] *= stride
+        # 过滤低分
+        mask = scores > score_thresh
 
-        all_bboxes.append(bboxes.reshape(B, -1, 4))
-        all_confs.append(cls_t[..., 0:1].reshape(B, -1).sigmoid())
-        all_helmets.append(cls_t[..., 1:3].reshape(B, -1, 2))
-        all_smokings.append(cls_t[..., 3:4].reshape(B, -1).sigmoid())
-        all_kpts.append(kpt_flat)
+        # 平铺
+        all_boxes.append(boxes)
+        all_scores.append(scores)
+        all_cls.append(cls_idx.expand(B, -1, -1))
 
-    bboxes = torch.cat(all_bboxes, dim=1)[0]
-    confs = torch.cat(all_confs, dim=1)[0]
-    helmets = torch.cat(all_helmets, dim=1)[0]
-    smokings = torch.cat(all_smokings, dim=1)[0]
-    kpts = torch.cat(all_kpts, dim=1)[0]
+        # 人体属性 (仅 person 类使用时有效)
+        N_per_lvl = H * W
+        kpt_t = head_outs["kpts"][lvl].permute(0, 2, 3, 1).reshape(B, N_per_lvl, 17, 3)
+        helm_t = head_outs["helmet"][lvl].permute(0, 2, 3, 1).reshape(B, N_per_lvl)      # [B, N]
+        smok_t = head_outs["smoking"][lvl].permute(0, 2, 3, 1).reshape(B, N_per_lvl, 1)
 
-    keep = confs > conf_threshold
-    if not keep.any():
-        return []
+        all_kpts.append(kpt_t)
+        all_helmet.append(helm_t)
+        all_smoke.append(smok_t)
 
-    bboxes, confs = bboxes[keep], confs[keep]
-    helmets, smokings = helmets[keep], smokings[keep]
-    kpts = kpts[keep]
+    boxes = torch.cat(all_boxes, dim=1)
+    scores = torch.cat(all_scores, dim=1)
+    classes = torch.cat(all_cls, dim=1)
+    kpts = torch.cat(all_kpts, dim=1)
+    helmet = torch.cat(all_helmet, dim=1)
+    smoking = torch.cat(all_smoke, dim=1).squeeze(-1)
 
-    order = confs.argsort(descending=True)
-    keep_indices = []
-    while order.numel() > 0:
-        if order.numel() == 1:
-            keep_indices.append(order.item())
-            break
-        idx = order[0].item()
-        keep_indices.append(idx)
-        ious = _box_iou_batch(bboxes[idx:idx + 1], bboxes[order[1:]])[0]
-        order = order[1:][ious < iou_threshold]
-
-    results = []
-    for idx in keep_indices[:50]:
-        k = kpts[idx].view(17, 3)
-        results.append(DecodedPerson(
-            bbox=bboxes[idx].clamp(0).tolist(),
-            confidence=confs[idx].detach().item(),
-            helmet_status=int(helmets[idx].argmax()),
-            helmet_conf=helmets[idx].max().detach().item(),
-            smoking_conf=smokings[idx].detach().item(),
-            keypoints=k.tolist(),
-        ))
-    return results
-
-
-def decode_anomaly_outputs(sa_cls, sa_reg, sa_mask, proto, input_shape, conf_threshold=0.15, iou_threshold=0.45):
-    CLASS_NAMES = ["fire", "water"]
-    all_bboxes, all_scores, all_classes, all_coeffs = [], [], [], []
-
-    for cls_t, reg_t, mask_t in zip(sa_cls, sa_reg, sa_mask):
-        B, _, H, W = cls_t.shape
-        cls_t = cls_t.permute(0, 2, 3, 1)
-        reg_t = reg_t.permute(0, 2, 3, 1)
-        mask_t = mask_t.permute(0, 2, 3, 1)
-
-        reg_t = reg_t.view(B, H, W, 4, 16).softmax(-1)
-        reg_t = (reg_t @ torch.arange(16, device=reg_t.device, dtype=reg_t.dtype))
-
-        grid = _make_grid(W, H, cls_t.device)
-        strides = input_shape[0] / W
-        reg_t[..., :2] = (reg_t[..., :2] + grid) * strides
-        reg_t[..., 2:4] = reg_t[..., 2:4] * strides * 2
-
-        cx, cy, w, h = reg_t[..., 0], reg_t[..., 1], reg_t[..., 2], reg_t[..., 3]
-        bboxes = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
-
-        scores = cls_t.sigmoid()
-        max_sc, max_cl = scores.max(dim=-1)
-
-        all_bboxes.append(bboxes.reshape(B, -1, 4))
-        all_scores.append(max_sc.reshape(B, -1))
-        all_classes.append(max_cl.reshape(B, -1))
-        all_coeffs.append(mask_t.reshape(B, -1, 32))
-
-    bboxes = torch.cat(all_bboxes, dim=1)[0]
-    scores = torch.cat(all_scores, dim=1)[0]
-    classes = torch.cat(all_classes, dim=1)[0]
-    coeffs = torch.cat(all_coeffs, dim=1)[0]
-
-    keep = scores > conf_threshold
-    if not keep.any():
-        return []
-    bboxes, scores, classes, coeffs = bboxes[keep], scores[keep], classes[keep], coeffs[keep]
-
-    keep_final = []
-    for cls_id in range(2):
-        mask_c = classes == cls_id
-        if not mask_c.any():
-            continue
-        b_c, s_c, idx_map = bboxes[mask_c], scores[mask_c], mask_c.nonzero().squeeze(-1)
-        order = s_c.argsort(descending=True)
-        while order.numel() > 0:
-            if order.numel() == 1:
-                keep_final.append(idx_map[order[0].item()].item())
-                break
-            idx = order[0].item()
-            keep_final.append(idx_map[idx].item())
-            ious = _box_iou_batch(b_c[idx:idx + 1], b_c[order[1:]])[0]
-            order = order[1:][ious < iou_threshold]
-
-    return [DecodedAnomaly(
-        bbox=bboxes[i].clamp(0).tolist(),
-        class_id=int(classes[i]),
-        class_name=CLASS_NAMES[int(classes[i])],
-        confidence=scores[i].detach().item(),
-        mask_coeffs=coeffs[i].tolist(),
-    ) for i in keep_final[:30]]
+    return boxes, scores, classes, kpts, helmet, smoking
