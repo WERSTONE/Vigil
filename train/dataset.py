@@ -352,16 +352,37 @@ def collate_fn(batch):
     return batch
 
 
-def make_dataloaders(dataset_specs, batch_size=1, augment=True, verbose=True):
-    loaders = {}
+def make_dataloaders(dataset_specs, batch_size=1, augment=True, val_ratio=0.0, verbose=True):
+    train_loaders = {}
+    val_loaders = {}
     for name, spec in dataset_specs.items():
         path = spec["path"]
         if not os.path.exists(path):
             if verbose: print(f"  [skip] {name}: {path} not found")
             continue
-        ds = UnifiedDataset(path, name, augment=augment)
-        loaders[name] = DataLoader(
-            ds, batch_size=batch_size, shuffle=True,
-            collate_fn=collate_fn, num_workers=0, drop_last=True)
-        if verbose: print(f"  [{name}] {len(ds)} samples")
-    return loaders
+        full_ds = UnifiedDataset(path, name, augment=augment)
+
+        if val_ratio > 0:
+            n_val = max(1, int(len(full_ds) * val_ratio))
+            n_train = len(full_ds) - n_val
+            indices = list(range(len(full_ds)))
+            import random
+            random.shuffle(indices)
+            train_ds = torch.utils.data.Subset(full_ds, indices[:n_train])
+            val_ds = torch.utils.data.Subset(full_ds, indices[n_train:])
+
+            train_loaders[name] = DataLoader(
+                train_ds, batch_size=batch_size, shuffle=True,
+                collate_fn=collate_fn, num_workers=0, drop_last=True)
+            val_loaders[name] = DataLoader(
+                val_ds, batch_size=batch_size, shuffle=False,
+                collate_fn=collate_fn, num_workers=0)
+            if verbose: print(f"  [{name}] {n_train} train / {n_val} val")
+        else:
+            train_loaders[name] = DataLoader(
+                full_ds, batch_size=batch_size, shuffle=True,
+                collate_fn=collate_fn, num_workers=0, drop_last=True)
+            if verbose: print(f"  [{name}] {len(full_ds)} samples")
+    if val_ratio > 0:
+        return train_loaders, val_loaders
+    return train_loaders
