@@ -155,7 +155,7 @@ def _mosaic4(samples, size=640):
             return k
 
         pb, pb_keep = _mx_boxes(sample.get("person_boxes"), scale, offset_x, offset_y)
-        db, _ = _mx_boxes(sample.get("detect_boxes"), scale, offset_x, offset_y)
+        db, db_keep = _mx_boxes(sample.get("detect_boxes"), scale, offset_x, offset_y)
         pk = _mx_kpts(sample.get("person_kpts"), scale, offset_x, offset_y)
 
         if pb is not None and len(pb) > 0:
@@ -165,7 +165,8 @@ def _mosaic4(samples, size=640):
             all_ps.append(sample.get("person_smoke", np.array([]))[pb_keep] if len(pb_keep) == len(sample.get("person_smoke", np.array([]))) else sample.get("person_smoke", np.array([])))
         if db is not None and len(db) > 0:
             all_db.append(db)
-            all_dc.append(sample.get("detect_classes", np.array([])))
+            dc = sample.get("detect_classes", np.array([]))
+            all_dc.append(dc[db_keep] if len(db_keep) == len(dc) else dc)
 
     return canvas, all_pb, all_pk, all_ph, all_ps, all_db, all_dc
 
