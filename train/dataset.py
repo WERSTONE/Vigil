@@ -87,6 +87,7 @@ def _flip_kpts(kpts, w):
 
 
 def _normalize(img):
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32) / 255.0
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -112,30 +113,22 @@ def _mosaic4(samples, size=640):
         nh, nw = int(img_h * r), int(img_w * r)
         img = cv2.resize(sample["img"], (nw, nh))
 
-        if i == 0:  # 左上
-            x1, y1 = max(0, cx - nw), max(0, cy - nh)
-            x2, y2 = min(nw, cx), min(nh, cy)
-            px, py = x1, y1
-        elif i == 1:  # 右上
-            x1, y1 = cx, max(0, cy - nh)
-            x2, y2 = min(size, cx + nw), min(nh, cy)
-            px, py = cx, y1
-        elif i == 2:  # 左下
-            x1, y1 = max(0, cx - nw), cy
-            x2, y2 = min(nw, cx), min(size, cy + nh)
-            px, py = x1, cy
-        else:  # 右下
-            x1, y1 = cx, cy
-            x2, y2 = min(size, cx + nw), min(size, cy + nh)
-            px, py = cx, cy
+        # ideal position of resized image on canvas (may be negative)
+        if i == 0:      px, py = cx - nw, cy - nh
+        elif i == 1:    px, py = cx,      cy - nh
+        elif i == 2:    px, py = cx - nw, cy
+        else:           px, py = cx,      cy
+
+        # canvas crop region (visible portion, clamped to [0, size])
+        x1 = max(0, px);       y1 = max(0, py)
+        x2 = min(size, px + nw); y2 = min(size, py + nh)
+        # source crop region (corresponding portion of resized image)
+        sx1 = x1 - px;         sy1 = y1 - py
+        sx2 = x2 - px;         sy2 = y2 - py
 
         cw, ch = x2 - x1, y2 - y1
         if cw > 0 and ch > 0:
-            canvas[y1:y2, x1:x2] = img[py - y1:py - y1 + ch, px - x1:px - x1 + cw]
-
-        # 坐标变换
-        scale = r
-        offset_x, offset_y = x1 - (px - x1), y1 - (py - y1)
+            canvas[y1:y2, x1:x2] = img[sy1:sy2, sx1:sx2]
 
         def _mx_boxes(b, sc, ox, oy):
             if b is None or len(b) == 0: return b, np.array([], dtype=bool)
@@ -154,9 +147,10 @@ def _mosaic4(samples, size=640):
             k[:, :, 1] = k[:, :, 1] * sc + oy
             return k
 
-        pb, pb_keep = _mx_boxes(sample.get("person_boxes"), scale, offset_x, offset_y)
-        db, db_keep = _mx_boxes(sample.get("detect_boxes"), scale, offset_x, offset_y)
-        pk = _mx_kpts(sample.get("person_kpts"), scale, offset_x, offset_y)
+        # label offset = ideal image position (may be negative)
+        pb, pb_keep = _mx_boxes(sample.get("person_boxes"), r, px, py)
+        db, db_keep = _mx_boxes(sample.get("detect_boxes"), r, px, py)
+        pk = _mx_kpts(sample.get("person_kpts"), r, px, py)
 
         if pb is not None and len(pb) > 0:
             all_pb.append(pb)
@@ -222,9 +216,10 @@ def _parse_label(lbl_path, img_w, img_h):
 
 class UnifiedDataset(Dataset):
 
-    def __init__(self, root, dataset_name, augment=True):
+    def __init__(self, root, dataset_name, augment=True, mosaic_pool=None):
         self.root = root
         self.name = dataset_name
+        self.mosaic_pool = mosaic_pool  # 跨数据集混合的全局样本池
         # augment: bool or dict (config)
         if isinstance(augment, dict):
             self.aug_cfg = augment
@@ -247,13 +242,18 @@ class UnifiedDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        # Mosaic
+        # Mosaic — 跨数据集混合: 首张图取自当前数据集, 其余 3 张从全局池随机选取
         mosaic_prob = self.aug_cfg.get("mosaic", {}).get("prob", 0.5) if self.aug_cfg.get("mosaic", {}).get("enabled", True) else 0.0
         if self.augment and np.random.random() < mosaic_prob:
-            indices = [idx] + [np.random.randint(0, len(self)) for _ in range(3)]
+            pool = self.mosaic_pool if self.mosaic_pool else self.samples
+            pool_size = len(pool)
+            indices = [idx] + [np.random.randint(0, pool_size) for _ in range(3)]
             samples = []
-            for j in indices:
-                img_path_j, lbl_path_j = self.samples[j]
+            for j, sample_idx in enumerate(indices):
+                if j == 0:
+                    img_path_j, lbl_path_j = self.samples[sample_idx]
+                else:
+                    img_path_j, lbl_path_j = pool[sample_idx]
                 img_j = cv2.imread(img_path_j)
                 if img_j is None:
                     continue
@@ -350,38 +350,58 @@ def collate_fn(batch):
     return batch
 
 
-def make_dataloaders(dataset_specs, batch_size=1, augment=True, val_ratio=0.0, verbose=True):
+def make_dataloaders(dataset_specs, batch_size=1, augment=True, val_ratio=0.0,
+                     num_workers=0, pin_memory=False, persistent_workers=False,
+                     verbose=True):
     train_loaders = {}
     val_loaders = {}
+
+    # —— 预建所有 train UnifiedDataset, 收集样本构建全局 Mosaic 池 ——
+    train_datasets = {}
     for name, spec in dataset_specs.items():
         path = spec["path"]
         if not os.path.exists(path):
             if verbose: print(f"  [skip] {name}: {path} not found")
             continue
+        train_datasets[name] = UnifiedDataset(path, name, augment=augment)
+
+    # 跨数据集 Mosaic 全局样本池
+    mosaic_pool = []
+    for ds in train_datasets.values():
+        mosaic_pool.extend(ds.samples)
+
+    for name, ds in train_datasets.items():
+        ds.mosaic_pool = mosaic_pool
 
         if val_ratio > 0:
-            train_ds = UnifiedDataset(path, name, augment=augment)
-            val_ds = UnifiedDataset(path, name, augment=False)
-            n_val = max(1, int(len(train_ds) * val_ratio))
-            n_train = len(train_ds) - n_val
-            indices = list(range(len(train_ds)))
+            val_ds = UnifiedDataset(ds.root, name, augment=False)
+            n_val = max(1, int(len(ds) * val_ratio))
+            n_train = len(ds) - n_val
+            indices = list(range(len(ds)))
             import random
             random.shuffle(indices)
-            train_sub = torch.utils.data.Subset(train_ds, indices[:n_train])
+            train_sub = torch.utils.data.Subset(ds, indices[:n_train])
             val_sub = torch.utils.data.Subset(val_ds, indices[n_train:])
 
             train_loaders[name] = DataLoader(
                 train_sub, batch_size=batch_size, shuffle=True,
-                collate_fn=collate_fn, num_workers=0, drop_last=True)
+                collate_fn=collate_fn, num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers and num_workers > 0,
+                drop_last=True)
             val_loaders[name] = DataLoader(
                 val_sub, batch_size=batch_size, shuffle=False,
-                collate_fn=collate_fn, num_workers=0)
+                collate_fn=collate_fn, num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers and num_workers > 0)
             if verbose: print(f"  [{name}] {n_train} train / {n_val} val")
         else:
-            ds = UnifiedDataset(path, name, augment=augment)
             train_loaders[name] = DataLoader(
                 ds, batch_size=batch_size, shuffle=True,
-                collate_fn=collate_fn, num_workers=0, drop_last=True)
+                collate_fn=collate_fn, num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers and num_workers > 0,
+                drop_last=True)
             if verbose: print(f"  [{name}] {len(ds)} samples")
     if val_ratio > 0:
         return train_loaders, val_loaders

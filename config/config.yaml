@@ -1,21 +1,11 @@
 # Vigil 推理配置
 
-# ── 模型架构 ──
-model:
-  input_size: [640, 640]
-  backbone: "yolov8n"
-  pretrained: true
-  num_keypoints: 17
-  anomaly_classes: 4
-  mask_dim: 32
-
 # ── 推理配置 ──
 inference:
   device: "cpu"
-  precision: "fp32"
-  conf_threshold_person: 0.25
-  conf_threshold_anomaly: 0.15
-  iou_threshold: 0.45
+  conf_threshold_person: 0.9
+  conf_threshold_anomaly: 0.9
+  iou_threshold: 0.9
 
 # ── 后处理参数 ──
 postprocess:

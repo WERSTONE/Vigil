@@ -5,12 +5,18 @@ import torch.nn as nn
 
 
 class Conv(nn.Module):
-    """Conv2d + BatchNorm + SiLU."""
-    def __init__(self, in_ch, out_ch, kernel=1, stride=1, padding=None, groups=1, act=True):
+    """Conv2d + Norm + SiLU."""
+    def __init__(self, in_ch, out_ch, kernel=1, stride=1, padding=None,
+                 groups=1, act=True, norm='bn', gn_groups=8):
         super().__init__()
         padding = (kernel - 1) // 2 if padding is None else padding
         self.conv = nn.Conv2d(in_ch, out_ch, kernel, stride, padding, groups=groups, bias=False)
-        self.bn = nn.BatchNorm2d(out_ch)
+        if norm == 'bn':
+            self.bn = nn.BatchNorm2d(out_ch)
+        elif norm == 'gn':
+            self.bn = nn.GroupNorm(min(gn_groups, out_ch), out_ch)
+        else:
+            self.bn = nn.Identity()
         self.act = nn.SiLU() if act else nn.Identity()
 
     def forward(self, x):
@@ -19,11 +25,11 @@ class Conv(nn.Module):
 
 class Bottleneck(nn.Module):
     """标准 Bottleneck: 1x1 降维 → 3x3 → 1x1 升维, 残差连接."""
-    def __init__(self, in_ch, out_ch, shortcut=True, e=0.5):
+    def __init__(self, in_ch, out_ch, shortcut=True, e=0.5, norm='bn', gn_groups=8):
         super().__init__()
         h = int(out_ch * e)
-        self.cv1 = Conv(in_ch, h, 1)
-        self.cv2 = Conv(h, out_ch, 3)
+        self.cv1 = Conv(in_ch, h, 1, norm=norm, gn_groups=gn_groups)
+        self.cv2 = Conv(h, out_ch, 3, norm=norm, gn_groups=gn_groups)
         self.shortcut = shortcut and in_ch == out_ch
 
     def forward(self, x):
@@ -33,13 +39,15 @@ class Bottleneck(nn.Module):
 class C2f(nn.Module):
     """CSP bottleneck with 2 convolutions (YOLOv8)."""
 
-    def __init__(self, in_ch, out_ch, n=1, shortcut=True, e=0.5):
+    def __init__(self, in_ch, out_ch, n=1, shortcut=True, e=0.5,
+                 norm='bn', gn_groups=8):
         super().__init__()
         self.c = int(out_ch * e)
-        self.cv1 = Conv(in_ch, 2 * self.c, 1)
-        self.cv2 = Conv((2 + n) * self.c, out_ch, 1)
+        self.cv1 = Conv(in_ch, 2 * self.c, 1, norm=norm, gn_groups=gn_groups)
+        self.cv2 = Conv((2 + n) * self.c, out_ch, 1, norm=norm, gn_groups=gn_groups)
         self.m = nn.ModuleList(
-            Bottleneck(self.c, self.c, shortcut, e=1.0) for _ in range(n))
+            Bottleneck(self.c, self.c, shortcut, e=1.0, norm=norm, gn_groups=gn_groups)
+            for _ in range(n))
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, dim=1))

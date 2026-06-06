@@ -1,7 +1,7 @@
-from models.common import Conv, Bottleneck, C2f, SPPF
-from models.backbone import CSPDarkNet
-from models.neck import FPNPANNeck
-from models.head import VigilHead, decode_outputs
-from models.assigner import CenterAssigner
-from models.loss import VigilLoss
-from models.model import VigilModel, create_model, export_onnx, export_torchscript
+from models.base import VigilModelBase
+from models.registry import MODEL_REGISTRY, register_model, create_model, list_models
+
+# 导入模型模块触发注册
+import models.vigil_v1.model  # noqa: F401 — 注册 "vigil_v1"
+import models.vigil_v2.model  # noqa: F401 — 注册 "vigil_v2"
+import models.vigil_v3.model  # noqa: F401 — 注册 "vigil_v3"

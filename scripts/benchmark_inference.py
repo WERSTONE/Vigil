@@ -39,13 +39,13 @@ def benchmark_pytorch(model, config, args):
 
 
 def benchmark_onnx(config, args, dummy):
-    from models.model import export_onnx
+    from models.vigil_v1.model import export_onnx
+    from models.registry import create_model
     size = tuple(config["model"].get("input_size", [640, 640]))
-    onnx_path = args.onnx if args.onnx != "auto" else f"vigil_{args.variant}.onnx"
+    onnx_path = args.onnx if args.onnx != "auto" else "vigil_v1.onnx"
 
     if args.onnx == "auto":
-        from models.model import create_model
-        model = create_model(variant=args.variant, pretrained_path=args.weights)
+        model = create_model("vigil_v1", pretrained=args.weights)
         model.eval()
         export_onnx(model, onnx_path, size)
 
@@ -68,12 +68,13 @@ def benchmark_onnx(config, args, dummy):
 
 
 def benchmark_torchscript(config, args):
-    from models.model import create_model, export_torchscript
+    from models.registry import create_model
+    from models.vigil_v1.model import export_torchscript
     size = tuple(config["model"].get("input_size", [640, 640]))
-    ts_path = args.torchscript if args.torchscript != "auto" else f"vigil_{args.variant}.pt"
+    ts_path = args.torchscript if args.torchscript != "auto" else "vigil_v1.pt"
 
     if args.torchscript == "auto":
-        model = create_model(variant=args.variant, pretrained_path=args.weights)
+        model = create_model("vigil_v1", pretrained=args.weights)
         model.eval()
         export_torchscript(model, ts_path, size)
 
@@ -85,20 +86,20 @@ def main():
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--weights", default=None)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--variant", default="n")
+    parser.add_argument("--model", default="vigil_v1")
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--onnx", nargs="?", const="auto", default=None)
     parser.add_argument("--torchscript", nargs="?", const="auto", default=None)
     args = parser.parse_args()
 
+    from models.registry import create_model
     import yaml
-    from models.model import create_model
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     logger.info(f"=== PyTorch Benchmark ({args.device}) ===")
-    model = create_model(variant=args.variant, pretrained_path=args.weights)
+    model = create_model(args.model, pretrained=args.weights)
     model, dummy = benchmark_pytorch(model, config, args)
 
     if args.onnx:

@@ -3,7 +3,7 @@ Vigil — 泵房多任务监控系统
 用法:
     python main.py demo <图片> --weights checkpoints/yolov8n.pt
     python main.py live --cam 0 --weights checkpoints/yolov8n.pt --show
-    python main.py live --video test.mp4 --weights checkpoints/yolov8n.pt --show
+    python main.py live --video test.mp4 --weights checkpoints/vigil_v2/pretrain_best.pt --model vigil_v2 --show
 """
 import argparse
 import sys
@@ -15,13 +15,11 @@ from loguru import logger
 
 
 def _build_engine(args):
-    from models.model import create_model
-    from inference.engine import InferenceEngine
-
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    model = create_model(variant=args.variant, pretrained_path=args.weights)
-    return InferenceEngine(model, config, device=args.device)
+    from inference.engine import create_engine
+    pretrained = args.weights if args.weights else True
+    return create_engine(model_name=args.model,
+                         config_path=args.config, device=args.device,
+                         pretrained=pretrained)
 
 
 def _draw_results(frame, result, latency_ms):
@@ -34,7 +32,7 @@ def _draw_results(frame, result, latency_ms):
         label = f"P {p.confidence:.2f}"
         if int(p.helmet_status) == 1:
             label += " NO_HELMET"
-        if float(p.smoking_conf) > 0.5:
+        if int(p.smoking_status) == 1:
             label += " SMOKE"
         cv2.putText(frame, label, (bx[0], bx[1] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
@@ -47,10 +45,9 @@ def _draw_results(frame, result, latency_ms):
 
     for a in result.anomalies:
         bx = [int(a.bbox[0]), int(a.bbox[1]), int(a.bbox[2]), int(a.bbox[3])]
-        color = (0, 0, 255) if a.class_id < 2 else (255, 128, 0)
-        cv2.rectangle(frame, (bx[0], bx[1]), (bx[2], bx[3]), color, 2)
+        cv2.rectangle(frame, (bx[0], bx[1]), (bx[2], bx[3]), (0, 0, 255), 2)
         cv2.putText(frame, f"{a.class_name} {a.confidence:.2f}",
-                    (bx[0], bx[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                    (bx[0], bx[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
     # 延迟 & FPS
     cv2.putText(frame, f"{latency_ms:.0f}ms", (w - 90, 20),
@@ -78,7 +75,7 @@ def cmd_demo(args):
     logger.info(f"Frame: {len(result.persons)} persons, {len(result.anomalies)} anomalies, "
                 f"{len(result.events)} events, latency={result.latency_ms:.1f}ms")
     for p in result.persons:
-        logger.info(f"  Person: conf={p.confidence:.3f} helmet={p.helmet_status} smoke={p.smoking_conf:.3f}")
+        logger.info(f"  Person: conf={p.confidence:.3f} helmet={p.helmet_status} smoke={p.smoking_status}")
     for a in result.anomalies:
         logger.info(f"  Anomaly: {a.class_name} conf={a.confidence:.3f}")
     for ev in result.events:
@@ -102,8 +99,7 @@ def cmd_live(args):
     else:
         from pipeline.gst_pipeline import VideoPipeline
         logger.info("RTSP mode (no --video/--cam)")
-        with open(args.config, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
+        config = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
 
         def on_frame(frame):
             result = engine.infer(frame)
@@ -169,10 +165,10 @@ def main():
     p_live.add_argument("--show", action="store_true", help="显示实时画面")
 
     for p in [p_demo, p_live]:
+        p.add_argument("--model", default="vigil_v2", help="注册的模型名称")
         p.add_argument("--config", default="config/config.yaml")
-        p.add_argument("--weights", default=None)
+        p.add_argument("--weights", default=None, help="权重路径 (省略则自动查找)")
         p.add_argument("--device", default="cpu")
-        p.add_argument("--variant", default="n")
 
     args = parser.parse_args()
     if args.cmd == "demo": cmd_demo(args)

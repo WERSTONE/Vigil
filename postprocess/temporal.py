@@ -1,6 +1,6 @@
 """
 时序后处理 — 跌倒(≥5s) + 挥手(≥2s) + 闯入/安全帽/越界/烟火/漏水事件生成
-接受 InferenceEngine 产出的 PersonResult / AnomalyResult (duck typing).
+接受 InferenceEngine 产出的 Person / Anomaly (duck typing).
 """
 import numpy as np
 from collections import deque
@@ -153,7 +153,7 @@ class PostProcessor:
             if int(p.helmet_status) == 1:
                 events.append({"type": "helmet_violation", "task_id": 2, "bbox": bbox, "confidence": float(p.helmet_conf)})
 
-            if float(p.smoking_conf) > 0.5:
+            if int(p.smoking_status) == 1:
                 events.append({"type": "smoking", "task_id": 4, "bbox": bbox, "confidence": float(p.smoking_conf)})
 
             # 越界检测: 基于跨帧侧变更
