@@ -3,9 +3,9 @@
 # ── 推理配置 ──
 inference:
   device: "cpu"
-  conf_threshold_person: 0.9
-  conf_threshold_anomaly: 0.9
-  iou_threshold: 0.9
+  conf_threshold_person: 0.5
+  conf_threshold_anomaly: 0.5
+  iou_threshold: 0.5
 
 # ── 后处理参数 ──
 postprocess:

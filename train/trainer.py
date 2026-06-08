@@ -52,7 +52,7 @@ class Trainer:
         # ── AMP ──
         self.use_amp = use_amp and device.startswith("cuda")
         self.amp_dtype = torch.bfloat16 if amp_dtype == "bfloat16" else torch.float16
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp and amp_dtype != "bfloat16" else None
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp and amp_dtype != "bfloat16" else None
         if self.use_amp:
             print(f"  AMP: {amp_dtype}" + (" (GradScaler)" if self.scaler else ""))
 

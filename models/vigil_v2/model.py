@@ -69,8 +69,7 @@ class VigilModelV2(VigilModelBase, nn.Module):
         gt_boxes, gt_classes, attrs = self._build_targets(sample, device)
 
         head_outs = self.forward(img)
-        # AMP: 前向用 fp16 加速, loss/assigner 在 fp32 下计算避免溢出
-        # (640×640 像素坐标平方可达 409600, 超出 fp16 最大值 65504)
+        # Loss/assigner 在 fp32 下计算避免溢出
         head_outs = {k: [t.float() for t in v] for k, v in head_outs.items()}
         feat_sizes = [(t.shape[2], t.shape[3]) for t in head_outs["cls"]]
 

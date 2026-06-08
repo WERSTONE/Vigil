@@ -8,24 +8,25 @@ model:
 # ── 训练超参数 ──
 training:
   device: "cuda"
-  batch_size: 2
+  batch_size: 4
   val_ratio: 0.3           # 验证集比例
-  grad_clip: 20.0          # 梯度裁剪
-  log_interval: 10         # 多少 batch 输出一次训练日志
-  val_interval: 1          # 多少 epoch 验证一次
+  grad_clip: 50.0          # 梯度裁剪
+  log_interval: 100         # 多少 batch 输出一次训练日志
+  val_interval: 2          # 多少 epoch 验证一次
+  save_interval: 5        # 多少 epoch 存一次 checkpoint
 
 # ── AMP 混合精度 (不影响 resume) ──
 amp:
-  enabled: false             # 是否启用自动混合精度
-  dtype: "float16"          # "float16" 或 "bfloat16" (需 Ampere+ 架构)
+  enabled: true             # 是否启用自动混合精度
+  dtype: "bfloat16"          # "float16" 或 "bfloat16" 
 
 # ── cuDNN 优化 ──
 cudnn:
-  benchmark: true           # 自动搜索最优卷积算法 (确定性略降, 提速 5-15%)
+  benchmark: true           # 自动搜索最优卷积算法 
 
 # ── DataLoader 优化 ──
 dataloader:
-  num_workers: 2            # 子进程数 (0=主进程加载, 建议 2-8)
+  num_workers: 0           # 子进程数 (0=主进程加载, mosaic 内存开销大时降低)
   pin_memory: true          # 锁页内存 → GPU 传输更快
   persistent_workers: true  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
 
@@ -46,7 +47,7 @@ augmentation:
     prob: 0.5
   mosaic:
     enabled: true
-    prob: 0.5
+    prob: 0.3
 
 # ── mAP 验证 ──
 map:
@@ -55,7 +56,7 @@ map:
 
 # ── 预训练阶段 ──
 pretrain:
-  epochs: 50
+  epochs: 150
   datasets:
     person:     {path: "data/processed/person"}
     helmet:     {path: "data/processed/helmet"}
@@ -64,7 +65,7 @@ pretrain:
     water_leak: {path: "data/processed/water_leak"}
   freeze: []
   optimizer:
-    lr: 0.0005
+    lr: 0.001
     weight_decay: 0.0001
     warmup_epochs: 3
   # output 默认为 checkpoints/{model_name}/pretrain，可在 CLI 用 --model 覆盖
