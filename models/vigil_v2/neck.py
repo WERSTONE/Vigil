@@ -7,7 +7,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.common import Conv, C2f
+from models.common import Conv, C2f, ECA
 
 
 class GatherDistributeNeck(nn.Module):
@@ -45,6 +45,10 @@ class GatherDistributeNeck(nn.Module):
         self.fuse_p4 = C2f(out_ch * 2, out_ch, n=1, norm=n, gn_groups=gn_groups)
         self.fuse_p5 = C2f(out_ch * 2, out_ch, n=1, norm=n, gn_groups=gn_groups)
 
+        self.eca_p3 = ECA(out_ch)
+        self.eca_p4 = ECA(out_ch)
+        self.eca_p5 = ECA(out_ch)
+
         self.out_channels = [out_ch] * 3
 
     def forward(self, feats):
@@ -75,4 +79,4 @@ class GatherDistributeNeck(nn.Module):
         p4_out = self.fuse_p4(torch.cat([m4, self.down_p3(p3_out)], dim=1))
         p5_out = self.fuse_p5(torch.cat([m5, self.down_p4(p4_out)], dim=1))
 
-        return [p3_out, p4_out, p5_out]
+        return [self.eca_p3(p3_out), self.eca_p4(p4_out), self.eca_p5(p5_out)]

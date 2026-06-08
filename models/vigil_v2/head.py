@@ -35,7 +35,7 @@ class VigilHeadV2(nn.Module):
     """
 
     def __init__(self, in_ch, num_classes=3, num_kpts=17, reg_max=16,
-                 tower_depth=2, kpt_attr_ch=64):
+                 tower_depth=2, kpt_attr_ch=64, dropout=0.05):
         super().__init__()
         self.num_classes = num_classes
         self.num_kpts = num_kpts
@@ -57,7 +57,25 @@ class VigilHeadV2(nn.Module):
         self.attr_tower = _make_tower(in_ch, kpt_attr_ch, tower_depth)
         self.attr_pred = nn.Conv2d(kpt_attr_ch, 2, 1)
 
+        self.drop_cls = nn.Dropout2d(dropout)
+        self.drop_reg = nn.Dropout2d(dropout)
+        self.drop_kpt = nn.Dropout2d(dropout)
+        self.drop_attr = nn.Dropout2d(dropout)
+
+        # 跨任务门控: cls↔reg 互相告知"哪里可能有物体"
+        self.gate_cls_from_reg = nn.Conv2d(in_ch, in_ch, 1)
+        self.gate_reg_from_cls = nn.Conv2d(in_ch, in_ch, 1)
+        # kpt/attr 塔用 cls 塔的特征辅助
+        self.gate_kpt_from_cls = nn.Conv2d(in_ch, kpt_attr_ch, 1)
+        self.gate_attr_from_cls = nn.Conv2d(in_ch, kpt_attr_ch, 1)
+
         self._init_weights()
+
+        # 门控初始化为近似直通 (sigmoid(0)=0.5 → 初始保留一半跨任务信号)
+        for m in [self.gate_cls_from_reg, self.gate_reg_from_cls,
+                  self.gate_kpt_from_cls, self.gate_attr_from_cls]:
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
 
     def _init_weights(self):
         for m in self.modules():
@@ -79,10 +97,21 @@ class VigilHeadV2(nn.Module):
         """features: List[[B, C, H, W]] (3 个尺度) → dict of List[Tensor]."""
         outs = {"cls": [], "reg": [], "kpt": [], "attr": []}
         for f in features:
-            outs["cls"].append(self.cls_pred(self.cls_tower(f)))
-            outs["reg"].append(self.reg_pred(self.reg_tower(f)))
-            outs["kpt"].append(self.kpt_pred(self.kpt_tower(f)))
-            outs["attr"].append(self.attr_pred(self.attr_tower(f)))
+            cls_raw = self.cls_tower(f)
+            reg_raw = self.reg_tower(f)
+            kpt_raw = self.kpt_tower(f)
+            attr_raw = self.attr_tower(f)
+
+            # 跨任务门控: 各 tower 用其他 tower 的原始特征做空间注意力
+            cls_feat = cls_raw * self.gate_cls_from_reg(reg_raw).sigmoid()
+            reg_feat = reg_raw * self.gate_reg_from_cls(cls_raw).sigmoid()
+            kpt_feat = kpt_raw * self.gate_kpt_from_cls(cls_raw).sigmoid()
+            attr_feat = attr_raw * self.gate_attr_from_cls(cls_raw).sigmoid()
+
+            outs["cls"].append(self.cls_pred(self.drop_cls(cls_feat)))
+            outs["reg"].append(self.reg_pred(self.drop_reg(reg_feat)))
+            outs["kpt"].append(self.kpt_pred(self.drop_kpt(kpt_feat)))
+            outs["attr"].append(self.attr_pred(self.drop_attr(attr_feat)))
         return outs
 
 
@@ -165,7 +194,7 @@ def decode_outputs_v2(head_outs, strides, reg_max, score_thresh=0.05):
         # xy 偏移 → 绝对坐标 (使用格点中心, 与 loss 一致)
         grid_center = grid.view(1, N, 1, 2) + 0.5 * stride
         kpt_xy = kpt_pred[..., :2] * stride + grid_center
-        kpt_vis = kpt_pred[..., 2:3]
+        kpt_vis = kpt_pred[..., 2:3].sigmoid()
         kpts = torch.cat([kpt_xy, kpt_vis], dim=-1)           # [B, N, 17, 3]
 
         # ── 属性 ──

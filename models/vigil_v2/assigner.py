@@ -81,6 +81,7 @@ class TaskAlignedAssigner:
         targets = [{
             "grid_xy": [], "gt_boxes": [], "gt_classes": [],
             "gt_kpts": [], "gt_helmet": [], "gt_smoking": [], "batch_idx": [],
+            "align_score": [],
         } for _ in range(num_levels)]
 
         # ── 1. 拼接所有 level ──
@@ -220,6 +221,7 @@ class TaskAlignedAssigner:
                 t["gt_boxes"].append(gt_box)
                 t["gt_classes"].append(gt_cls_i)
                 t["batch_idx"].append(0)
+                t["align_score"].append(align_valid[topk_local[k]])
 
                 t["gt_kpts"].append(gt_kpt_val)
                 t["gt_helmet"].append(gt_helm_val)
@@ -237,6 +239,7 @@ class TaskAlignedAssigner:
                 "grid_xy": torch.stack(t["grid_xy"], dim=0),                    # [K, 2]
                 "gt_boxes": torch.stack(t["gt_boxes"], dim=0),                  # [K, 4]
                 "gt_classes": torch.stack(t["gt_classes"], dim=0),              # [K]
+                "align_score": torch.stack(t["align_score"], dim=0),            # [K]
                 "gt_kpts": (torch.stack([x for x in t["gt_kpts"] if x is not None])
                             if any(x is not None for x in t["gt_kpts"]) else None),
                 "gt_helmet": (torch.stack([x for x in t["gt_helmet"] if x is not None])

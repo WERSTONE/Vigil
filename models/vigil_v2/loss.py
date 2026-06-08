@@ -28,25 +28,25 @@ def _iou_xyxy(pred, target):
 
 # ── 分类损失 ──
 
-def _cls_loss(pred, target, alpha=0.25, gamma=2.0):
-    """统一的分类损失。
+def _cls_loss(pred, target, alpha=0.5, gamma=2.0):
+    """分类损失，支持硬标签和软标签。
 
-    正样本: 标准 BCE（权重始终=1，不随 pt 增大而衰减）。
-    负样本: Focal-style 下权重 α·pt^γ，压制大量易分负样本。
-    返回 sum，由调用方按正样本数归一化。
-
-    Varifocal 的教训: 正样本权重不能依赖 IoU（冷启动时 IoU≈0），
-    也不能随 pt 快速衰减（Focal 在 pt→1 时衰减 4000 倍导致 cls 梯度消失）。
+    正样本 (target > 0): BCE 天然支持软标签 (target=0.3 时 sigmoid 最优值=0.3),
+        weight=target (高质量匹配权重高，低质量自动降权)。
+    负样本 (target == 0): Focal 压制 α·pt^γ，大量易分背景被抑制。
 
     Args:
         pred: [N, C] logits
-        target: [N, C] 正样本=1, 负样本=0
+        target: [N, C] ∈ [0, 1], 0=背景, >0=正样本(可为软标签)
     """
     bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
     pt = torch.exp(-bce)
-    pos_weight = target                     # =1 for positives
-    neg_weight = alpha * (1 - pt).pow(gamma)  # <1 for easy negatives, full weight for hard (false positive)
-    weight = torch.where(target > 0.5, pos_weight, neg_weight)
+    pos_mask = target > 0
+    # 正样本: target 本身是质量权重, 低质量匹配自然贡献小
+    pos_weight = target
+    # 负样本: Focal 抑制, 但对 hard negative (假阳性) 保持高权重
+    neg_weight = alpha * (1 - pt).pow(gamma)
+    weight = torch.where(pos_mask, pos_weight, neg_weight)
     return (weight * bce).sum()
 
 
@@ -189,6 +189,9 @@ class VigilLossV2(nn.Module):
             gt_boxes = targets["gt_boxes"].to(device)
             gt_classes = targets["gt_classes"].to(device)
             batch_idx = targets["batch_idx"].to(device)
+            align_scores = targets.get("align_score", torch.ones(N_pos, device=device))
+            if isinstance(align_scores, torch.Tensor):
+                align_scores = align_scores.to(device)
 
             gx, gy = grid[:, 0], grid[:, 1]
 
@@ -217,9 +220,11 @@ class VigilLossV2(nn.Module):
             # ── IoU ──
             iou, _, _ = _iou_xyxy(pred_xyxy, gt_boxes)
 
-            # ── 填充正样本 cls target (向量化) ──
+            # ── 填充正样本 cls target (质量感知软标签) ──
             flat_idx = gy * W + gx  # [N_pos]
-            cls_tgt_all[batch_idx, flat_idx, gt_classes] = 1.0
+            # alignment 得分作为软标签: 高质量匹配 ≈1.0, 低质量 ≈0.1
+            soft_targets = align_scores.clamp(min=0.05, max=1.0)
+            cls_tgt_all[batch_idx, flat_idx, gt_classes] = soft_targets
 
             # cls loss on ALL positions (正+负), sum-based
             loss_cls += _cls_loss(
@@ -266,22 +271,28 @@ class VigilLossV2(nn.Module):
                             (p_boxes[:, 3] - p_boxes[:, 1])).clamp(min=1).sqrt()
                     sigmas = self.sigmas.view(1, 17).to(device)
                     d2 = (pk_xy - gk_xy).pow(2).sum(dim=-1)
-                    k2 = (2 * sigmas) ** 2 * area.unsqueeze(-1) + 1e-8
+                    k2 = sigmas.pow(2) * area.pow(2).unsqueeze(-1) + 1e-8
                     oks = (d2 / (-2 * k2)).exp()
                     visible = (gt_k_idx[..., 2] > 0).float()
                     # per-sample mean OKS → per-sample loss → sum over level
                     per_sample_oks = (oks * visible).sum(dim=1) / visible.sum(dim=1).clamp(min=1)
                     loss_kpt += (1 - per_sample_oks).sum()
 
+                    # 关键点可见度监督 (BCE, 量级与 OKS loss 对齐)
+                    pk_vis = pk[..., 2]
+                    gt_vis = (gt_k_idx[..., 2] > 0).float()
+                    loss_kpt += 0.1 * F.binary_cross_entropy_with_logits(
+                        pk_vis.reshape(-1), gt_vis.reshape(-1), reduction="sum")
+
                 # 头盔
                 if targets["gt_helmet"] is not None:
                     gt_h = targets["gt_helmet"].to(device).float()
-                    loss_helm += _focal_bce(attr_p[p_idx, 0], 1 - gt_h, gamma=2.0, pos_weight=1.5)
+                    loss_helm += _focal_bce(attr_p[p_idx, 0], 1 - gt_h, gamma=2.0, pos_weight=4.0)
 
                 # 吸烟
                 if targets["gt_smoking"] is not None:
                     gt_s = targets["gt_smoking"].to(device).float()
-                    loss_smoke += _focal_bce(attr_p[p_idx, 1], gt_s, gamma=2.0, pos_weight=3.0)
+                    loss_smoke += _focal_bce(attr_p[p_idx, 1], gt_s, gamma=2.0, pos_weight=6.0)
 
         return {
             "cls":    self.w_cls   * (loss_cls / max(total_pos, 1)),

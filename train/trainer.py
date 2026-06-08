@@ -27,7 +27,8 @@ class Trainer:
                  save_dir="checkpoints",
                  use_tensorboard=False, tb_log_dir="logs/train_logs",
                  use_amp=False, amp_dtype="float16",
-                 map_enabled=True, map_samples=500):
+                 map_enabled=True, map_samples=500,
+                 ema_decay=0.9999):
         self.model = model.to(device)
         self.device = device
         self.grad_clip = grad_clip
@@ -49,6 +50,13 @@ class Trainer:
         self.map_enabled = map_enabled
         self.map_samples = map_samples
 
+        # ── EMA ──
+        self.ema_decay = ema_decay
+        self.ema_enabled = ema_decay > 0
+        self._ema_state = {}  # {name: shadow_tensor}
+        if self.ema_enabled:
+            self._build_ema()
+
         # ── AMP ──
         self.use_amp = use_amp and device.startswith("cuda")
         self.amp_dtype = torch.bfloat16 if amp_dtype == "bfloat16" else torch.float16
@@ -61,6 +69,37 @@ class Trainer:
             from torch.utils.tensorboard import SummaryWriter
             self.writer = SummaryWriter(log_dir=tb_log_dir)
             print(f"  TensorBoard: {tb_log_dir}")
+
+    def _build_ema(self):
+        """创建 EMA 影子参数 (仅 trainable params)."""
+        for name, p in self.model.named_parameters():
+            if p.requires_grad:
+                self._ema_state[name] = p.data.clone().detach()
+
+    def _update_ema(self):
+        """EMA 更新: shadow = decay * shadow + (1-decay) * current."""
+        d = self.ema_decay
+        for name, p in self.model.named_parameters():
+            if name in self._ema_state:
+                self._ema_state[name].mul_(d).add_(p.data, alpha=1 - d)
+
+    def _swap_ema(self, to_ema=True):
+        """交换模型权重与 EMA 影子 (to_ema=True → 用 EMA 替换当前权重)."""
+        if not self.ema_enabled:
+            return
+        for name, p in self.model.named_parameters():
+            if name in self._ema_state:
+                if to_ema:
+                    # 保存当前到 _ema_state 的临时备份 → 这个不行，会破坏 EMA
+                    # 正确的做法：swap
+                    tmp = p.data.clone()
+                    p.data.copy_(self._ema_state[name])
+                    self._ema_state[name] = tmp
+                else:
+                    # swap back
+                    tmp = p.data.clone()
+                    p.data.copy_(self._ema_state[name])
+                    self._ema_state[name] = tmp
 
     def _get_lr(self, epoch, max_epochs):
         if epoch < self.warmup_epochs:
@@ -164,6 +203,9 @@ class Trainer:
             metrics["loss"] += avg_loss.item()
             step += 1
 
+            if self.ema_enabled:
+                self._update_ema()
+
             if step % self.log_interval == 0:
                 pct = step / n_batches * 100
                 parts = []
@@ -185,6 +227,7 @@ class Trainer:
     @torch.no_grad()
     def validate(self, loaders):
         self.model.eval()
+        self._swap_ema(to_ema=True)  # 用 EMA 权重做验证
         metrics = defaultdict(float)
         n = 0
 
@@ -201,6 +244,7 @@ class Trainer:
                             metrics["val_" + k] += v.item()
                     n += 1
 
+        self._swap_ema(to_ema=True)  # swap back (对称操作)
         for k in metrics:
             metrics[k] /= max(n, 1)
         return metrics
@@ -217,6 +261,7 @@ class Trainer:
         """
         import numpy as np
         self.model.eval()
+        self._swap_ema(to_ema=True)
 
         all_preds = []  # (boxes, scores, classes) per image
         all_gts = []    # (boxes, classes) per image
@@ -262,6 +307,7 @@ class Trainer:
 
         valid = [v for v in aps.values() if v is not None]
         mAP = float(np.mean(valid)) if valid else 0.0
+        self._swap_ema(to_ema=True)  # swap back
         return mAP, aps
 
     def _compute_ap(self, all_preds, all_gts, cls_idx, iou_thresh=0.5):
@@ -339,6 +385,8 @@ class Trainer:
         return inter / (area1 + area2 - inter + 1e-16)
 
     def save(self, path, metrics=None):
+        # 保存时使用 EMA 权重 (若启用)
+        self._swap_ema(to_ema=True)
         state = {
             "epoch": self.current_epoch + 1,
             "global_step": self.global_step,
@@ -348,7 +396,11 @@ class Trainer:
         }
         if self.scaler:
             state["scaler_state_dict"] = self.scaler.state_dict()
+        if self.ema_enabled:
+            state["ema_state"] = {
+                name: t.clone() for name, t in self._ema_state.items()}
         torch.save(state, str(path))
+        self._swap_ema(to_ema=True)  # swap back
         print(f"  Saved: {path}")
 
     def load(self, path):
@@ -358,6 +410,10 @@ class Trainer:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if self.scaler and "scaler_state_dict" in ckpt:
             self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if self.ema_enabled and "ema_state" in ckpt:
+            self._ema_state = {
+                name: t.to(self.device)
+                for name, t in ckpt["ema_state"].items()}
         self.current_epoch = ckpt.get("epoch", 0)
         self.global_step = ckpt.get("global_step", 0)
         print(f"  Loaded: {path} (epoch {self.current_epoch})")

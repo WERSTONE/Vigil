@@ -148,6 +148,9 @@ class VigilModelV2(VigilModelBase, nn.Module):
             entry["boxes"][:, 2] *= sx
             entry["boxes"][:, 1] *= sy
             entry["boxes"][:, 3] *= sy
+            if "kpts" in entry:
+                entry["kpts"][..., 0] *= sx
+                entry["kpts"][..., 1] *= sy
         return det
 
     def _preprocess(self, frame: np.ndarray) -> torch.Tensor:

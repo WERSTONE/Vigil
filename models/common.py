@@ -1,4 +1,4 @@
-"""基础模块: Conv, Bottleneck, SPPF."""
+"""基础模块: Conv, Bottleneck, SPPF, ECA."""
 
 import torch
 import torch.nn as nn
@@ -70,3 +70,24 @@ class SPPF(nn.Module):
         p2 = nn.functional.max_pool2d(p1, self.k, 1, self.k // 2)
         p3 = nn.functional.max_pool2d(p2, self.k, 1, self.k // 2)
         return self.cv2(torch.cat([x, p1, p2, p3], dim=1))
+
+
+class ECA(nn.Module):
+    """Efficient Channel Attention — 1D 卷积跨通道交互，参数 ≈ k 个.
+
+    加入 ECA 后 neck 可以自动学习各通道对不同任务 (cls/reg/kpt/attr) 的重要性。
+    """
+
+    def __init__(self, ch, k=3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        y = self.avg_pool(x)                     # [B, C, 1, 1]
+        y = y.squeeze(-1).transpose(-1, -2)      # [B, 1, C]
+        y = self.conv(y)                          # [B, 1, C]
+        y = y.transpose(-1, -2).unsqueeze(-1)    # [B, C, 1, 1]
+        return x * self.sigmoid(y)
