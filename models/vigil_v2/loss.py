@@ -222,8 +222,8 @@ class VigilLossV2(nn.Module):
 
             # ── 填充正样本 cls target (质量感知软标签) ──
             flat_idx = gy * W + gx  # [N_pos]
-            # alignment 得分作为软标签: 高质量匹配 ≈1.0, 低质量 ≈0.1
-            soft_targets = align_scores.clamp(min=0.05, max=1.0)
+            # alignment 得分作为软标签: floor=0.3 保证冷启动梯度充足
+            soft_targets = align_scores.clamp(min=0.3, max=1.0)
             cls_tgt_all[batch_idx, flat_idx, gt_classes] = soft_targets
 
             # cls loss on ALL positions (正+负), sum-based
