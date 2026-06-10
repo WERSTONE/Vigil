@@ -132,7 +132,7 @@ class VigilLossV2(nn.Module):
         w_box, w_cls, w_dfl, w_kpt, w_helm, w_smoke: 损失权重
     """
 
-    def __init__(self, w_box=7.5, w_cls=1.0, w_dfl=3.0,
+    def __init__(self, w_box=5.0, w_cls=1.0, w_dfl=12.0,
                  w_kpt=10.0, w_helm=10.0, w_smoke=10.0,
                  reg_max=16, kpt_sigmas=None):
         super().__init__()

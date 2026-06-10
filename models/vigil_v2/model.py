@@ -26,10 +26,10 @@ from models.vigil_v2.loss import VigilLossV2
 
 class VigilModelV2(VigilModelBase, nn.Module):
 
-    def __init__(self, backbone_w=0.75, neck_ch=128, reg_max=16,
-                 w_box=7.5, w_cls=1.0, w_dfl=5.0,
+    def __init__(self, backbone_w=0.75, neck_ch=160, reg_max=16,
+                 w_box=5.0, w_cls=1.0, w_dfl=12.0,
                  w_kpt=10.0, w_helm=10.0, w_smoke=10.0,
-                 assigner_topk=13):
+                 assigner_topk=20):
         super().__init__()
         self.backbone = CSPDarkNetV2(w=backbone_w)
         self.neck = GatherDistributeNeck(
@@ -160,7 +160,7 @@ class VigilModelV2(VigilModelBase, nn.Module):
         img = np.transpose(img, (2, 0, 1))
         return torch.from_numpy(img).unsqueeze(0)
 
-    def _decode(self, raw_outputs, score_thresh=0.05) -> dict:
+    def _decode(self, raw_outputs, score_thresh=0.0) -> dict:
         boxes, scores, kpts, helmet, smoking = decode_outputs_v2(
             raw_outputs, self.strides, self.reg_max, score_thresh)
         boxes, scores = boxes[0], scores[0]

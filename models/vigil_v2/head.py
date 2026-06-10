@@ -35,7 +35,7 @@ class VigilHeadV2(nn.Module):
     """
 
     def __init__(self, in_ch, num_classes=3, num_kpts=17, reg_max=16,
-                 tower_depth=2, kpt_attr_ch=64, dropout=0.05):
+                 tower_depth=2, kpt_attr_ch=96, dropout=0.05):
         super().__init__()
         self.num_classes = num_classes
         self.num_kpts = num_kpts
@@ -71,11 +71,11 @@ class VigilHeadV2(nn.Module):
 
         self._init_weights()
 
-        # 门控初始化为近似直通 (sigmoid(0)=0.5 → 初始保留一半跨任务信号)
+        # 门控初始化为近似直通 (sigmoid(2)≈0.88 → 初始大部分保留)
         for m in [self.gate_cls_from_reg, self.gate_reg_from_cls,
                   self.gate_kpt_from_cls, self.gate_attr_from_cls]:
             nn.init.zeros_(m.weight)
-            nn.init.zeros_(m.bias)
+            nn.init.constant_(m.bias, 2.0)
 
     def _init_weights(self):
         for m in self.modules():
@@ -83,8 +83,8 @@ class VigilHeadV2(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-        # cls bias prior: 降低初始假阳性
-        nn.init.constant_(self.cls_pred.bias, -4.595)
+        # cls bias: 初始 ≈0.27, 接近软标签 floor=0.3, 加速冷启动
+        nn.init.constant_(self.cls_pred.bias, -1.0)
         # reg bias: 让 DFL 分布向低 bin 略微倾斜 → 初始框适中 → IoU 合理
         # 4 条边各 16 bins，每条边内 bin 0 略高 → 期望偏移 ≈ 4.5 (而非默认的 7.5)
         reg_bias = torch.zeros(4 * self.reg_max)
