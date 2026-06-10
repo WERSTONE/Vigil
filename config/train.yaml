@@ -8,9 +8,9 @@ model:
 # ── 训练超参数 ──
 training:
   device: "cuda"
-  batch_size: 4
+  batch_size: 8
   val_ratio: 0.3           # 验证集比例
-  grad_clip: 50.0          # 梯度裁剪
+  grad_clip: 20.0          # 梯度裁剪
   log_interval: 100         # 多少 batch 输出一次训练日志
   val_interval:  1         # 多少 epoch 验证一次
   save_interval: 3        # 多少 epoch 存一次 checkpoint
@@ -26,7 +26,7 @@ cudnn:
 
 # ── DataLoader 优化 ──
 dataloader:
-  num_workers: 0           # 子进程数 (0=主进程加载, mosaic 内存开销大时降低)
+  num_workers: 4           # 子进程数 (0=主进程加载, mosaic 内存开销大时降低)
   pin_memory: true          # 锁页内存 → GPU 传输更快
   persistent_workers: true  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
 
