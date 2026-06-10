@@ -29,14 +29,15 @@ class VigilModelV2(VigilModelBase, nn.Module):
     def __init__(self, backbone_w=0.75, neck_ch=160, reg_max=16,
                  w_box=5.0, w_cls=1.0, w_dfl=12.0,
                  w_kpt=10.0, w_helm=10.0, w_smoke=10.0,
-                 assigner_topk=20):
+                 assigner_topk=20, head_dropout=0.1):
         super().__init__()
         self.backbone = CSPDarkNetV2(w=backbone_w)
         self.neck = GatherDistributeNeck(
             in_channels=self.backbone.out_channels[1:4],  # p3, p4, p5
             out_ch=neck_ch,
         )
-        self.head = VigilHeadV2(neck_ch, num_classes=3, reg_max=reg_max)
+        self.head = VigilHeadV2(neck_ch, num_classes=3, reg_max=reg_max,
+                                dropout=head_dropout)
         self.strides = [8, 16, 32]
         self.reg_max = reg_max
         self._input_size = (640, 640)

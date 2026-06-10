@@ -3,13 +3,21 @@
 # ── 模型 (name 对应 registry 注册名, kwargs 透传给模型工厂) ──
 model:
   name: "vigil_v2"
-  kwargs: {}               # 模型特定参数 (如 loss 权重)
+  kwargs:
+    w_box: 7.5
+    w_cls: 3.0
+    w_dfl: 5.0
+    w_kpt: 6.0
+    backbone_w: 0.5        # 0.75→0.5, 减少参数量防过拟合
+    neck_ch: 128           # 160→128, 减少 neck 通道数
+    w_smoke: 5.0           # 10→5, 小数据集降低损失权重
+    w_helm: 5.0            # 10→5, 同上
 
 # ── 训练超参数 ──
 training:
   device: "cuda"
-  batch_size: 12
-  val_ratio: 0.3           # 验证集比例
+  batch_size: 24
+  val_ratio: 0.2           # 验证集比例 (0.3→0.2, 保留更多训练数据)
   grad_clip: 20.0          # 梯度裁剪
   log_interval: 100         # 多少 batch 输出一次训练日志
   val_interval:  1         # 多少 epoch 验证一次
@@ -26,13 +34,14 @@ cudnn:
 
 # ── DataLoader 优化 ──
 dataloader:
-  num_workers: 2           # 子进程数 (5 数据集 × 2 < 默认 fd 上限)
+  num_workers: 4           # 子进程数 (5 数据集 × 2 < 默认 fd 上限)
   pin_memory: true          # 锁页内存 → GPU 传输更快
   persistent_workers: true  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
+  prefetch_factor: 2
 
 # ── TensorBoard ──
 tensorboard:
-  enabled: false            # 是否启用
+  enabled: true            # 是否启用
   log_dir: "logs/train_logs"  # 日志保存目录
 
 # ── 数据增强 ──
@@ -47,7 +56,7 @@ augmentation:
     prob: 0.5
   mosaic:
     enabled: true
-    prob: 0.2
+    prob: 0.5              # 0.2→0.5, 更强的 mosaic 正则化
 
 # ── mAP 验证 ──
 map:
@@ -56,18 +65,18 @@ map:
 
 # ── 预训练阶段 ──
 pretrain:
-  epochs: 150
+  epochs: 250
   datasets:
     person:     {path: "data/processed/person"}
     helmet:     {path: "data/processed/helmet"}
     fire_smoke: {path: "data/processed/fire_smoke"}
-    smoking:    {path: "data/processed/smoking", weight: 3.0}
+    smoking:    {path: "data/processed/smoking", weight: 1.5}   # weight 3→1.5, 减缓小数据集过拟合
     water_leak: {path: "data/processed/water_leak"}
   freeze: []
   optimizer:
-    lr: 0.0015
-    weight_decay: 0.0001
-    warmup_epochs: 3
+    lr: 0.001             # 0.0015→0.0008, 降低学习率防过拟合
+    weight_decay: 0.0005  # 0.0001→0.0005, 增强 L2 正则化
+    warmup_epochs: 5       # 3→5, 更平滑的预热
   # output 默认为 checkpoints/{model_name}/pretrain，可在 CLI 用 --model 覆盖
 
 # ── 微调阶段 ──
