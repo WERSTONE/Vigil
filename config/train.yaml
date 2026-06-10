@@ -26,9 +26,9 @@ cudnn:
 
 # ── DataLoader 优化 ──
 dataloader:
-  num_workers: 4           # 子进程数 (0=主进程加载, mosaic 内存开销大时降低)
+  num_workers: 0           # 子进程数 (0=主进程加载, Python 3.12+ 多数据集下避免 fd 超限)
   pin_memory: true          # 锁页内存 → GPU 传输更快
-  persistent_workers: true  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
+  persistent_workers: false  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
 
 # ── TensorBoard ──
 tensorboard:
