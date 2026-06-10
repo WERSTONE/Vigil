@@ -8,7 +8,7 @@ model:
 # ── 训练超参数 ──
 training:
   device: "cuda"
-  batch_size: 8
+  batch_size: 12
   val_ratio: 0.3           # 验证集比例
   grad_clip: 20.0          # 梯度裁剪
   log_interval: 100         # 多少 batch 输出一次训练日志
@@ -26,9 +26,9 @@ cudnn:
 
 # ── DataLoader 优化 ──
 dataloader:
-  num_workers: 0           # 子进程数 (0=主进程加载, Python 3.12+ 多数据集下避免 fd 超限)
+  num_workers: 2           # 子进程数 (5 数据集 × 2 < 默认 fd 上限)
   pin_memory: true          # 锁页内存 → GPU 传输更快
-  persistent_workers: false  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
+  persistent_workers: true  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
 
 # ── TensorBoard ──
 tensorboard:
