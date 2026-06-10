@@ -169,23 +169,19 @@ class Trainer:
             lr = self._get_lr(self.current_epoch, max_epochs)
             self._set_lr(lr)
 
-            total_loss = torch.tensor(0.0, device=self.device)
+            if self.use_amp:
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype):
+                    losses = self.model.compute_loss(batch)
+            else:
+                losses = self.model.compute_loss(batch)
+            total_loss = losses["total"]
+            for k, v in losses.items():
+                if isinstance(v, torch.Tensor):
+                    running[k] += v.item()
 
-            for sample in batch:
-                if self.use_amp:
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype):
-                        losses = self.model.compute_loss(sample)
-                else:
-                    losses = self.model.compute_loss(sample)
-                total_loss += losses["total"]
-                for k, v in losses.items():
-                    if isinstance(v, torch.Tensor):
-                        running[k] += v.item()
-
-            avg_loss = total_loss / len(batch)
             self.optimizer.zero_grad()
             if self.scaler:
-                self.scaler.scale(avg_loss).backward()
+                self.scaler.scale(total_loss).backward()
                 if self.grad_clip > 0:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -193,14 +189,14 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                avg_loss.backward()
+                total_loss.backward()
                 if self.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
 
             self.global_step += 1
-            metrics["loss"] += avg_loss.item()
+            metrics["loss"] += total_loss.item()
             step += 1
 
             if self.ema_enabled:
@@ -233,16 +229,15 @@ class Trainer:
 
         for dl in loaders.values():
             for batch in dl:
-                for sample in batch:
-                    if self.use_amp:
-                        with torch.amp.autocast("cuda", dtype=self.amp_dtype):
-                            losses = self.model.compute_loss(sample)
-                    else:
-                        losses = self.model.compute_loss(sample)
-                    for k, v in losses.items():
-                        if isinstance(v, torch.Tensor):
-                            metrics["val_" + k] += v.item()
-                    n += 1
+                if self.use_amp:
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype):
+                        losses = self.model.compute_loss(batch)
+                else:
+                    losses = self.model.compute_loss(batch)
+                for k, v in losses.items():
+                    if isinstance(v, torch.Tensor):
+                        metrics["val_" + k] += v.item()
+                n += 1
 
         self._swap_ema(to_ema=True)  # swap back (对称操作)
         for k in metrics:

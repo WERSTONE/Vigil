@@ -29,15 +29,14 @@ class VigilModelBase(ABC):
         ...
 
     @abstractmethod
-    def compute_loss(self, sample) -> Dict[str, Union[torch.Tensor, float]]:
-        """从单个 VigilSample 计算损失.
+    def compute_loss(self, samples) -> Dict[str, Union[torch.Tensor, float]]:
+        """从一批 VigilSample 计算损失.
 
         模型内部负责: forward → GT构建 → 正负样本分配 → 设备迁移 → 损失计算.
-        训练器只负责循环和反向传播，不关心模型内部结构.
+        训练器只负责传 batch 和反向传播，不关心模型内部结构.
 
         Args:
-            sample: VigilSample (image, person_boxes, person_kpts,
-                    person_helmet, person_smoke, detect_boxes, detect_classes).
+            samples: List[VigilSample] — 一个 batch 的样本列表.
 
         Returns:
             dict 必须包含 "total" (Tensor, 用于 backward).

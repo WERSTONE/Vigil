@@ -54,19 +54,20 @@ class TaskAlignedAssigner:
 
     def __call__(self, pred_scores, pred_boxes,
                  gt_boxes, gt_classes, gt_attrs,
-                 feat_sizes, strides):
+                 feat_sizes, strides, batch_indices=None):
         """
         Args:
-            pred_scores: List[[1, H*W, 3]]  各层预测得分 (after sigmoid)
-            pred_boxes:  List[[1, H*W, 4]]  各层预测框 xyxy (DFL decoded)
+            pred_scores: List[[B, H*W, 3]]  各层预测得分 (after sigmoid)
+            pred_boxes:  List[[B, H*W, 4]]  各层预测框 xyxy (DFL decoded)
             gt_boxes:    [M, 4] xyxy
             gt_classes:  [M]
             gt_attrs:    dict with kpts/helmet/smoking (or empty)
             feat_sizes:  List[(H, W)]
             strides:     List[int]
+            batch_indices: [M] 每个 GT 属于 batch 中的第几张图, None=全为0
 
         Returns:
-            targets: List[dict or None] per level (与 v1 兼容格式)
+            targets: List[dict or None] per level
         """
         device = gt_boxes.device
         num_levels = len(feat_sizes)
@@ -116,6 +117,7 @@ class TaskAlignedAssigner:
         for gt_i in range(num_gts):
             gt_box = gt_boxes[gt_i]     # [4]
             gt_cls_i = gt_cls[gt_i]
+            gt_batch = batch_indices[gt_i].item() if batch_indices is not None else 0
 
             # ── 3a. Center-radius 约束: 网格中心必须在 GT 框内 ──
             if self.center_radius >= 0:
@@ -182,8 +184,8 @@ class TaskAlignedAssigner:
 
             # ── 3d. 计算 alignment ──
             valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-            cls_valid = all_scores[0, valid_indices, gt_cls_i]  # [K]
-            ious_valid = _box_iou(all_boxes[0, valid_indices], gt_box.unsqueeze(0)).squeeze(-1)  # [K]
+            cls_valid = all_scores[gt_batch, valid_indices, gt_cls_i]  # [K]
+            ious_valid = _box_iou(all_boxes[gt_batch, valid_indices], gt_box.unsqueeze(0)).squeeze(-1)  # [K]
             align_valid = cls_valid.pow(self.alpha) * ious_valid.pow(self.beta)
 
             # ── 3e. Top-k 选择 ──
@@ -220,7 +222,7 @@ class TaskAlignedAssigner:
                 t["grid_xy"].append(torch.tensor([gx, gy], device=device))
                 t["gt_boxes"].append(gt_box)
                 t["gt_classes"].append(gt_cls_i)
-                t["batch_idx"].append(0)
+                t["batch_idx"].append(gt_batch)
                 t["align_score"].append(align_valid[topk_local[k]])
 
                 t["gt_kpts"].append(gt_kpt_val)

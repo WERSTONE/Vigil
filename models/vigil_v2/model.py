@@ -62,13 +62,17 @@ class VigilModelV2(VigilModelBase, nn.Module):
 
     # ── 训练接口: compute_loss ──
 
-    def compute_loss(self, sample):
+    def compute_loss(self, samples):
+        """samples: List[VigilSample] — 一个 batch 的样本列表."""
         device = next(self.parameters()).device
-        img = sample.image.unsqueeze(0).to(device)
+        if not isinstance(samples, list):
+            samples = [samples]
 
-        gt_boxes, gt_classes, attrs = self._build_targets(sample, device)
+        imgs = torch.stack([s.image for s in samples]).to(device)
 
-        head_outs = self.forward(img)
+        gt_boxes, gt_classes, attrs, batch_indices = self._build_targets(samples, device)
+
+        head_outs = self.forward(imgs)
         # Loss/assigner 在 fp32 下计算避免溢出
         head_outs = {k: [t.float() for t in v] for k, v in head_outs.items()}
         feat_sizes = [(t.shape[2], t.shape[3]) for t in head_outs["cls"]]
@@ -80,7 +84,7 @@ class VigilModelV2(VigilModelBase, nn.Module):
         targets = self.assigner(
             pred_scores, pred_boxes,
             gt_boxes, gt_classes, attrs,
-            feat_sizes, self.strides)
+            feat_sizes, self.strides, batch_indices)
 
         losses = self.loss_fn(head_outs, targets, self.strides, feat_sizes)
         total = (losses["cls"] + losses["ciou"] + losses["dfl"] +
@@ -88,32 +92,51 @@ class VigilModelV2(VigilModelBase, nn.Module):
         losses["total"] = total
         return losses
 
-    def _build_targets(self, sample, device):
-        """构建 GT tensor (与 v1 相同)."""
-        gt_boxes, gt_classes = [], []
-        n_p = len(sample.person_boxes)
-        if n_p > 0:
-            gt_boxes.append(sample.person_boxes)
-            gt_classes.append(torch.zeros(n_p, dtype=torch.long, device=device))
-        if sample.detect_boxes.numel() > 0:
-            gt_boxes.append(sample.detect_boxes)
-            gt_classes.append(sample.detect_classes.to(device))
+    def _build_targets(self, samples, device):
+        """构建 GT tensor, 附加 batch 索引.
 
-        if not gt_boxes:
-            return (torch.empty(0, 4, device=device),
-                    torch.empty(0, dtype=torch.long, device=device), {})
+        samples: List[VigilSample]
+        Returns: gt_boxes [M,4], gt_classes [M], attrs dict, batch_indices [M]
+        """
+        gt_boxes_list, gt_classes_list, batch_idx_list = [], [], []
+        kpts_list, helmet_list, smoke_list = [], [], []
 
-        all_boxes = torch.cat(gt_boxes, dim=0).to(device)
-        all_classes = torch.cat(gt_classes, dim=0)
+        for b, sample in enumerate(samples):
+            n_p = len(sample.person_boxes)
+            if n_p > 0:
+                gt_boxes_list.append(sample.person_boxes)
+                gt_classes_list.append(torch.zeros(n_p, dtype=torch.long))
+                batch_idx_list.append(torch.full((n_p,), b, dtype=torch.long))
+                if sample.person_kpts.numel() > 0:
+                    kpts_list.append(sample.person_kpts)
+                if sample.person_helmet.numel() > 0:
+                    helmet_list.append(sample.person_helmet)
+                if sample.person_smoke.numel() > 0:
+                    smoke_list.append(sample.person_smoke)
+
+            if sample.detect_boxes.numel() > 0:
+                n_d = len(sample.detect_boxes)
+                gt_boxes_list.append(sample.detect_boxes)
+                gt_classes_list.append(sample.detect_classes)
+                batch_idx_list.append(torch.full((n_d,), b, dtype=torch.long))
+
+        if not gt_boxes_list:
+            return (torch.empty(0, 4), torch.empty(0, dtype=torch.long),
+                    {}, torch.empty(0, dtype=torch.long))
+
+        all_boxes = torch.cat(gt_boxes_list, dim=0).to(device)
+        all_classes = torch.cat(gt_classes_list, dim=0).to(device)
+        batch_indices = torch.cat(batch_idx_list, dim=0).to(device)
+
         attrs = {}
-        if n_p > 0:
-            if sample.person_kpts.numel() > 0:
-                attrs["kpts"] = sample.person_kpts.to(device)
-            if sample.person_helmet.numel() > 0:
-                attrs["helmet"] = sample.person_helmet.to(device)
-            if sample.person_smoke.numel() > 0:
-                attrs["smoking"] = sample.person_smoke.to(device)
-        return all_boxes, all_classes, attrs
+        if kpts_list:
+            attrs["kpts"] = torch.cat(kpts_list, dim=0).to(device)
+        if helmet_list:
+            attrs["helmet"] = torch.cat(helmet_list, dim=0).to(device)
+        if smoke_list:
+            attrs["smoking"] = torch.cat(smoke_list, dim=0).to(device)
+
+        return all_boxes, all_classes, attrs, batch_indices
 
     @torch.no_grad()
     def _decode_for_assigner(self, head_outs, feat_sizes):
