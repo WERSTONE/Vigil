@@ -23,12 +23,14 @@ Thumbs.db
 
 # Claude
 .claude/
+AGENTS.md
 
 # Environment
 .env
 .env.local
 *.log
 logs/
+.ultralytics/
 
 # Weights
 checkpoints/
@@ -39,8 +41,10 @@ CLAUDE.md
 test.mp4
 *.pt
 data/raw/
+data/coco/
 data/backups/
 data/viz_kpts/
 data/viz_final/
-
+outputs_vis_preview*.jpg
+00010000173000000.mp4
 docs

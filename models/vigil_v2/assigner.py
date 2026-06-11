@@ -110,7 +110,6 @@ class TaskAlignedAssigner:
         all_centers = torch.cat(all_centers, dim=0)  # [total_N, 2]
 
         gt_cls = gt_classes.long()
-        n_person = (gt_cls == 0).sum().item()
 
         # ── 3. 每个 GT 独立分配 ──
         person_count = 0
@@ -196,7 +195,7 @@ class TaskAlignedAssigner:
             gt_kpt_val = None
             gt_helm_val = None
             gt_smoke_val = None
-            if gt_cls_i == 0 and n_person > 0:
+            if gt_cls_i == 0:
                 if gt_attrs and "kpts" in gt_attrs:
                     gt_kpt_val = gt_attrs["kpts"][person_count]
                 if gt_attrs and "helmet" in gt_attrs:
@@ -237,11 +236,23 @@ class TaskAlignedAssigner:
                 merged.append(None)
                 continue
 
+            # Resolve conflicts where multiple GTs select the same grid.
+            # Keep the assignment with the strongest task-aligned score.
+            best_by_cell = {}
+            for i, (grid, batch_idx, align_score) in enumerate(zip(
+                    t["grid_xy"], t["batch_idx"], t["align_score"])):
+                key = (int(batch_idx), int(grid[0]), int(grid[1]))
+                prev = best_by_cell.get(key)
+                if prev is None or align_score > t["align_score"][prev]:
+                    best_by_cell[key] = i
+            keep = sorted(best_by_cell.values())
+            for key in t:
+                t[key] = [t[key][i] for i in keep]
+
             merged.append({
                 "grid_xy": torch.stack(t["grid_xy"], dim=0),                    # [K, 2]
                 "gt_boxes": torch.stack(t["gt_boxes"], dim=0),                  # [K, 4]
                 "gt_classes": torch.stack(t["gt_classes"], dim=0),              # [K]
-                "align_score": torch.stack(t["align_score"], dim=0),            # [K]
                 "gt_kpts": (torch.stack([x for x in t["gt_kpts"] if x is not None])
                             if any(x is not None for x in t["gt_kpts"]) else None),
                 "gt_helmet": (torch.stack([x for x in t["gt_helmet"] if x is not None])

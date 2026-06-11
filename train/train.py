@@ -6,7 +6,7 @@ Vigil 训练入口 — 模型无关.
     python -m train.train --stage pretrain --model my_model --config config/train.yaml
 """
 
-import argparse, sys, yaml, os
+import argparse, sys, yaml, os, copy
 import torch
 from models.registry import create_model
 from train.trainer import Trainer
@@ -15,7 +15,8 @@ from train.dataset import make_dataloaders
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", default="pretrain", choices=["pretrain", "finetune"])
+    parser.add_argument("--stage", default="pretrain",
+                        choices=["coco_pose_pretrain", "pretrain", "finetune"])
     parser.add_argument("--config", default="config/train.yaml")
     parser.add_argument("--model", default=None, help="覆盖 yaml 中的 model.name")
     parser.add_argument("--device", default=None)
@@ -54,14 +55,19 @@ def main():
     tb_log_dir = tb_cfg.get("log_dir", "logs/train_logs")
     freeze = stage_cfg.get("freeze", [])
 
-    model_name = args.model or model_cfg.get("name", "vigil_v1")
+    model_name = args.model or model_cfg.get("name", "vigil_v2")
     save_dir = stage_cfg.get("output", f"checkpoints/{model_name}")
-    model_kwargs = model_cfg.get("kwargs", {})
+    model_kwargs = copy.deepcopy(model_cfg.get("kwargs", {}))
+    model_kwargs.update(stage_cfg.get("model_kwargs", {}))
 
     pretrained = args.pretrained or stage_cfg.get("pretrained")
-    # finetune 自动查找 pretrain 最佳权重
-    if pretrained is None and args.stage == "finetune":
-        default_pt = f"checkpoints/{model_name}/pretrain_best.pt"
+    # 自动串联训练阶段: pretrain 接 coco_pose_pretrain, finetune 接 pretrain.
+    auto_pretrained = {
+        "pretrain": f"checkpoints/{model_name}/coco_pose_pretrain_best.pt",
+        "finetune": f"checkpoints/{model_name}/pretrain_best.pt",
+    }
+    if pretrained is None and args.stage in auto_pretrained:
+        default_pt = auto_pretrained[args.stage]
         if os.path.exists(default_pt):
             pretrained = default_pt
             print(f"  auto pretrained: {default_pt}")

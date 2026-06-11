@@ -1,12 +1,19 @@
 # Vigil 推理配置
 
+# ── 模型配置: 当前已下载的 vigil_v2/pretrain_best.pt 使用 0.5/128。
+# 新一轮 0.75/160 训练完成后再同步更新这里。
+model:
+  name: "vigil_v2"
+  kwargs:
+    backbone_w: 0.5
+    neck_ch: 128
+
 # ── 推理配置 ──
 inference:
-  device: "cpu"
-  conf_threshold_person: 0.5
-  conf_threshold_anomaly: 0.5
+  device: "cuda"
+  conf_threshold_person: 0.7
+  conf_threshold_anomaly: 0.7
   iou_threshold: 0.5
-
 # ── 后处理参数 ──
 postprocess:
   roi_zones: []

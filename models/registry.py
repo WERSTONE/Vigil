@@ -41,10 +41,12 @@ def _resolve_weights(name: str, pretrained: Union[bool, str, None]) -> Union[str
         return None
     if isinstance(pretrained, str):
         return pretrained
-    # pretrained=True → 自动查找
-    auto = Path(CHECKPOINT_ROOT) / name / "best.pt"
-    if auto.exists():
-        return str(auto)
+    # pretrained=True -> 自动按统一 checkpoint 约定查找。
+    root = Path(CHECKPOINT_ROOT) / name
+    for filename in ("pretrain_best.pt", "finetune_best.pt", "pretrain_last.pt", "best.pt"):
+        auto = root / filename
+        if auto.exists():
+            return str(auto)
     return None
 
 

@@ -39,15 +39,11 @@ def benchmark_pytorch(model, config, args):
 
 
 def benchmark_onnx(config, args, dummy):
-    from models.vigil_v1.model import export_onnx
-    from models.registry import create_model
-    size = tuple(config["model"].get("input_size", [640, 640]))
-    onnx_path = args.onnx if args.onnx != "auto" else "vigil_v1.onnx"
-
     if args.onnx == "auto":
-        model = create_model("vigil_v1", pretrained=args.weights)
-        model.eval()
-        export_onnx(model, onnx_path, size)
+        logger.warning("vigil_v2 does not provide automatic ONNX export; pass an existing ONNX path.")
+        return
+
+    onnx_path = args.onnx
 
     try:
         import onnxruntime as ort
@@ -68,17 +64,11 @@ def benchmark_onnx(config, args, dummy):
 
 
 def benchmark_torchscript(config, args):
-    from models.registry import create_model
-    from models.vigil_v1.model import export_torchscript
-    size = tuple(config["model"].get("input_size", [640, 640]))
-    ts_path = args.torchscript if args.torchscript != "auto" else "vigil_v1.pt"
-
     if args.torchscript == "auto":
-        model = create_model("vigil_v1", pretrained=args.weights)
-        model.eval()
-        export_torchscript(model, ts_path, size)
+        logger.warning("vigil_v2 does not provide automatic TorchScript export yet.")
+        return
 
-    logger.info(f"TorchScript exported: {ts_path}")
+    logger.info(f"TorchScript path provided: {args.torchscript}")
 
 
 def main():
@@ -86,7 +76,7 @@ def main():
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--weights", default=None)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--model", default="vigil_v1")
+    parser.add_argument("--model", default="vigil_v2")
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--onnx", nargs="?", const="auto", default=None)
     parser.add_argument("--torchscript", nargs="?", const="auto", default=None)

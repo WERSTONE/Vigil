@@ -1,9 +1,10 @@
 """
 Vigil — 泵房多任务监控系统
 用法:
-    python main.py demo <图片> --weights checkpoints/yolov8n.pt
-    python main.py live --cam 0 --weights checkpoints/yolov8n.pt --show
+    python main.py demo <图片> --model vigil_v2 --weights checkpoints/vigil_v2/pretrain_best.pt
+    python main.py live --cam 0 --model yolov8_pose --weights checkpoints/yolov8_pose/yolov8n-pose.pt --show
     python main.py live --video test.mp4 --weights checkpoints/vigil_v2/pretrain_best.pt --model vigil_v2 --show
+    python main.py live --video test.mp4 --model yolov8_pose --show
 """
 import argparse
 import sys
@@ -14,6 +15,22 @@ import yaml
 from loguru import logger
 
 
+COCO_SKELETON = [
+    (5, 7), (7, 9),        # left arm
+    (6, 8), (8, 10),       # right arm
+    (5, 6),                # shoulders
+    (5, 11), (6, 12),      # torso
+    (11, 12),              # hips
+    (11, 13), (13, 15),    # left leg
+    (12, 14), (14, 16),    # right leg
+    (0, 1), (0, 2),        # nose to eyes
+    (1, 3), (2, 4),        # eyes to ears
+]
+
+LEFT_KPTS = {5, 7, 9, 11, 13, 15}
+RIGHT_KPTS = {6, 8, 10, 12, 14, 16}
+
+
 def _build_engine(args):
     from inference.engine import create_engine
     pretrained = args.weights if args.weights else True
@@ -22,26 +39,93 @@ def _build_engine(args):
                          pretrained=pretrained)
 
 
+def _clip_box(box, width, height):
+    x1, y1, x2, y2 = [int(round(v)) for v in box]
+    return [
+        max(0, min(width - 1, x1)),
+        max(0, min(height - 1, y1)),
+        max(0, min(width - 1, x2)),
+        max(0, min(height - 1, y2)),
+    ]
+
+
+def _draw_label(frame, lines, origin, fg=(255, 255, 255), bg=(35, 35, 35)):
+    x, y = origin
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.48
+    thickness = 1
+    line_h = 17
+    sizes = [cv2.getTextSize(t, font, scale, thickness)[0] for t in lines]
+    box_w = max(s[0] for s in sizes) + 10
+    box_h = line_h * len(lines) + 8
+    x = max(0, min(frame.shape[1] - box_w - 1, x))
+    y = max(box_h + 2, y)
+    cv2.rectangle(frame, (x, y - box_h), (x + box_w, y), bg, -1)
+    cv2.rectangle(frame, (x, y - box_h), (x + box_w, y), fg, 1)
+    for i, text in enumerate(lines):
+        cv2.putText(frame, text, (x + 5, y - box_h + 15 + i * line_h),
+                    font, scale, fg, thickness, cv2.LINE_AA)
+
+
+def _draw_pose(frame, keypoints, conf_thresh=0.3):
+    if not keypoints or len(keypoints) < 17:
+        return
+
+    pts = []
+    for kp in keypoints[:17]:
+        if len(kp) < 3:
+            pts.append(None)
+            continue
+        x, y, conf = float(kp[0]), float(kp[1]), float(kp[2])
+        if conf <= conf_thresh or x <= 0 or y <= 0:
+            pts.append(None)
+        else:
+            pts.append((int(round(x)), int(round(y)), conf))
+
+    for a, b in COCO_SKELETON:
+        if pts[a] is None or pts[b] is None:
+            continue
+        color = (80, 220, 80)
+        if a in LEFT_KPTS or b in LEFT_KPTS:
+            color = (255, 170, 60)
+        elif a in RIGHT_KPTS or b in RIGHT_KPTS:
+            color = (60, 180, 255)
+        cv2.line(frame, pts[a][:2], pts[b][:2], color, 2, cv2.LINE_AA)
+
+    for idx, pt in enumerate(pts):
+        if pt is None:
+            continue
+        color = (80, 220, 80)
+        if idx in LEFT_KPTS:
+            color = (255, 170, 60)
+        elif idx in RIGHT_KPTS:
+            color = (60, 180, 255)
+        cv2.circle(frame, pt[:2], 4, (20, 20, 20), -1, cv2.LINE_AA)
+        cv2.circle(frame, pt[:2], 3, color, -1, cv2.LINE_AA)
+
+
 def _draw_results(frame, result, latency_ms):
     """在画面上绘制检测框和事件"""
     h, w = frame.shape[:2]
 
     for p in result.persons:
-        bx = [int(p.bbox[0]), int(p.bbox[1]), int(p.bbox[2]), int(p.bbox[3])]
-        cv2.rectangle(frame, (bx[0], bx[1]), (bx[2], bx[3]), (0, 255, 0), 2)
-        label = f"P {p.confidence:.2f}"
-        if int(p.helmet_status) == 1:
-            label += " NO_HELMET"
-        if int(p.smoking_status) == 1:
-            label += " SMOKE"
-        cv2.putText(frame, label, (bx[0], bx[1] - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        bx = _clip_box(p.bbox, w, h)
+        helmet_unknown = int(p.helmet_status) < 0
+        smoke_unknown = int(p.smoking_status) < 0
+        helmet_bad = int(p.helmet_status) == 1
+        smoke_bad = int(p.smoking_status) == 1
+        box_color = (0, 165, 255) if helmet_bad or smoke_bad else (40, 220, 90)
+        cv2.rectangle(frame, (bx[0], bx[1]), (bx[2], bx[3]), box_color, 2, cv2.LINE_AA)
 
-        # 画关键点
-        if p.keypoints and len(p.keypoints) == 17:
-            for kx, ky, kc in p.keypoints:
-                if kc > 0.3:
-                    cv2.circle(frame, (int(kx), int(ky)), 2, (0, 0, 255), -1)
+        helmet_text = "HELMET N/A" if helmet_unknown else ("NO_HELMET" if helmet_bad else "HELMET")
+        smoke_text = "SMOKE N/A" if smoke_unknown else ("SMOKE" if smoke_bad else "NO_SMOKE")
+        label_lines = [
+            f"PERSON {p.confidence:.2f}",
+            helmet_text if helmet_unknown else f"{helmet_text} {p.helmet_conf:.2f}",
+            smoke_text if smoke_unknown else f"{smoke_text} {p.smoking_conf:.2f}",
+        ]
+        _draw_label(frame, label_lines, (bx[0], bx[1] - 6), bg=(28, 35, 30) if not helmet_bad and not smoke_bad else (35, 25, 15))
+        _draw_pose(frame, p.keypoints)
 
     for a in result.anomalies:
         bx = [int(a.bbox[0]), int(a.bbox[1]), int(a.bbox[2]), int(a.bbox[3])]
@@ -168,7 +252,7 @@ def main():
         p.add_argument("--model", default="vigil_v2", help="注册的模型名称")
         p.add_argument("--config", default="config/config.yaml")
         p.add_argument("--weights", default=None, help="权重路径 (省略则自动查找)")
-        p.add_argument("--device", default="cpu")
+        p.add_argument("--device", default=None)
 
     args = parser.parse_args()
     if args.cmd == "demo": cmd_demo(args)

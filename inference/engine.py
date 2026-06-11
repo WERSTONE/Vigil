@@ -135,13 +135,23 @@ class InferenceEngine:
         for i in range(len(boxes)):
             h = torch.sigmoid(helmet[i]).item()
             s = torch.sigmoid(smoking[i]).item()
+            if not np.isfinite(h):
+                helmet_status, helmet_conf = -1, 0.0
+            else:
+                helmet_status = 0 if h > 0.5 else 1
+                helmet_conf = h if helmet_status == 0 else 1 - h
+            if not np.isfinite(s):
+                smoking_status, smoking_conf = -1, 0.0
+            else:
+                smoking_status = 1 if s > 0.5 else 0
+                smoking_conf = s if smoking_status == 1 else 1 - s
             results.append(Person(
                 bbox=boxes[i].clamp(min=0).tolist(),
                 confidence=scores[i].item(),
-                helmet_status=0 if h > 0.5 else 1,
-                helmet_conf=h,
-                smoking_status=1 if s > 0.5 else 0,
-                smoking_conf=s,
+                helmet_status=helmet_status,
+                helmet_conf=helmet_conf,
+                smoking_status=smoking_status,
+                smoking_conf=smoking_conf,
                 keypoints=kpts[i].cpu().tolist(),
             ))
         return results
@@ -168,9 +178,9 @@ class InferenceEngine:
         return results
 
 
-def create_engine(model_name: str = "vigil_v1",
+def create_engine(model_name: str = "vigil_v2",
                   config_path: str = "config/config.yaml",
-                  device: str = "cpu",
+                  device: str = None,
                   pretrained=None,
                   **model_kwargs) -> InferenceEngine:
     """便捷工厂: 从注册表创建模型 + 从 YAML 加载配置 → 引擎.
@@ -188,8 +198,15 @@ def create_engine(model_name: str = "vigil_v1",
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    inf = config.setdefault("inference", {})
+    inf.setdefault("device", "cpu")
     if device:
-        config.setdefault("inference", {})["device"] = device
+        inf["device"] = device
+
+    # 从 config 读取模型参数 (优先级低于显式传入的 kwargs)
+    yaml_model_kwargs = config.get("model", {}).get("kwargs", {})
+    yaml_model_kwargs.update(model_kwargs)
+    model_kwargs = yaml_model_kwargs
 
     # 自动解析权重路径
     if pretrained is True:
@@ -197,7 +214,12 @@ def create_engine(model_name: str = "vigil_v1",
             f"checkpoints/{model_name}/pretrain_best.pt",
             f"checkpoints/{model_name}/finetune_best.pt",
             f"checkpoints/{model_name}/pretrain_last.pt",
+            f"checkpoints/{model_name}/best.pt",
         ]
+        if model_name == "yolov8":
+            candidates.append("checkpoints/yolov8/yolov8n.pt")
+        elif model_name in ("yolov8_pose", "yolov8-pose"):
+            candidates.append("checkpoints/yolov8_pose/yolov8n-pose.pt")
         pretrained = None
         for c in candidates:
             if os.path.exists(c):
@@ -209,5 +231,3 @@ def create_engine(model_name: str = "vigil_v1",
 
     model = create_registered_model(model_name, pretrained=pretrained, **model_kwargs)
     return InferenceEngine(model, config)
-
-

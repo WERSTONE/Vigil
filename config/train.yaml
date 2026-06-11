@@ -4,19 +4,19 @@
 model:
   name: "vigil_v2"
   kwargs:
+    backbone_w: 1.5        # larger v2 backbone for stronger pose/attribute features
+    neck_ch: 320           # wider neck, about 16M parameters
     w_box: 7.5
     w_cls: 3.0
     w_dfl: 5.0
     w_kpt: 6.0
-    backbone_w: 0.5        # 0.75→0.5, 减少参数量防过拟合
-    neck_ch: 128           # 160→128, 减少 neck 通道数
     w_smoke: 5.0           # 10→5, 小数据集降低损失权重
     w_helm: 5.0            # 10→5, 同上
 
 # ── 训练超参数 ──
 training:
   device: "cuda"
-  batch_size: 24
+  batch_size: 16
   val_ratio: 0.2           # 验证集比例 (0.3→0.2, 保留更多训练数据)
   grad_clip: 20.0          # 梯度裁剪
   log_interval: 100         # 多少 batch 输出一次训练日志
@@ -63,7 +63,24 @@ map:
   enabled: false             # 是否在验证时计算 mAP@0.5
   val_samples: 500          # 每次验证采样的图片数 (越大越精确也越慢, 0=全部)
 
-# ── 预训练阶段 ──
+# ── COCO person/pose 预训练阶段 ──
+coco_pose_pretrain:
+  epochs: 120
+  datasets:
+    coco_person_pose: {path: "data/processed/coco_person_pose"}
+  freeze: []
+  # 这里的 w_helm/w_smoke 是 loss 权重，不是标签取值。
+  # helmet 标签仍然是 0=戴帽, 1=未戴帽。
+  model_kwargs:
+    w_helm: 0.0
+    w_smoke: 0.0
+  optimizer:
+    lr: 0.001
+    weight_decay: 0.0005
+    warmup_epochs: 5
+  pretrained: null
+
+# ── 多任务预训练阶段 ──
 pretrain:
   epochs: 250
   datasets:
@@ -77,17 +94,20 @@ pretrain:
     lr: 0.001             # 0.0015→0.0008, 降低学习率防过拟合
     weight_decay: 0.0005  # 0.0001→0.0005, 增强 L2 正则化
     warmup_epochs: 5       # 3→5, 更平滑的预热
-  # output 默认为 checkpoints/{model_name}/pretrain，可在 CLI 用 --model 覆盖
+  pretrained: null         # 默认自动接 checkpoints/{model_name}/coco_pose_pretrain_best.pt
 
 # ── 微调阶段 ──
 finetune:
-  epochs: 50
+  epochs: 60
   datasets:
-    custom: {path: "data/raw/custom"}
-  freeze: ["backbone"]
+    person:     {path: "data/processed/person"}
+    helmet:     {path: "data/processed/helmet"}
+    fire_smoke: {path: "data/processed/fire_smoke"}
+    smoking:    {path: "data/processed/smoking", weight: 1.5}
+    water_leak: {path: "data/processed/water_leak"}
+  freeze: []
   optimizer:
-    lr: 0.0005
-    weight_decay: 0.0001
-    warmup_epochs: 3
-  # pretrained 默认为 checkpoints/{model_name}/pretrain_best.pt
-  # output 默认为 checkpoints/{model_name}/finetune
+    lr: 0.0002
+    weight_decay: 0.0005
+    warmup_epochs: 2
+  pretrained: null         # 默认自动接 checkpoints/{model_name}/pretrain_best.pt

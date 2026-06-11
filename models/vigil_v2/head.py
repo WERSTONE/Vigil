@@ -35,7 +35,7 @@ class VigilHeadV2(nn.Module):
     """
 
     def __init__(self, in_ch, num_classes=3, num_kpts=17, reg_max=16,
-                 tower_depth=2, kpt_attr_ch=96, dropout=0.05):
+                 tower_depth=2, kpt_attr_ch=96):
         super().__init__()
         self.num_classes = num_classes
         self.num_kpts = num_kpts
@@ -56,11 +56,6 @@ class VigilHeadV2(nn.Module):
         # 属性分支 (轻量)
         self.attr_tower = _make_tower(in_ch, kpt_attr_ch, tower_depth)
         self.attr_pred = nn.Conv2d(kpt_attr_ch, 2, 1)
-
-        self.drop_cls = nn.Dropout2d(dropout)
-        self.drop_reg = nn.Dropout2d(dropout)
-        self.drop_kpt = nn.Dropout2d(dropout)
-        self.drop_attr = nn.Dropout2d(dropout)
 
         # 跨任务门控: cls↔reg 互相告知"哪里可能有物体"
         self.gate_cls_from_reg = nn.Conv2d(in_ch, in_ch, 1)
@@ -83,7 +78,7 @@ class VigilHeadV2(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-        # cls bias: 初始 ≈0.27, 接近软标签 floor=0.3, 加速冷启动
+        # cls bias: 初始 score ≈0.27，避免冷启动时正样本梯度太弱
         nn.init.constant_(self.cls_pred.bias, -1.0)
         # reg bias: 让 DFL 分布向低 bin 略微倾斜 → 初始框适中 → IoU 合理
         # 4 条边各 16 bins，每条边内 bin 0 略高 → 期望偏移 ≈ 4.5 (而非默认的 7.5)
@@ -108,10 +103,10 @@ class VigilHeadV2(nn.Module):
             kpt_feat = kpt_raw * self.gate_kpt_from_cls(cls_raw).sigmoid()
             attr_feat = attr_raw * self.gate_attr_from_cls(cls_raw).sigmoid()
 
-            outs["cls"].append(self.cls_pred(self.drop_cls(cls_feat)))
-            outs["reg"].append(self.reg_pred(self.drop_reg(reg_feat)))
-            outs["kpt"].append(self.kpt_pred(self.drop_kpt(kpt_feat)))
-            outs["attr"].append(self.attr_pred(self.drop_attr(attr_feat)))
+            outs["cls"].append(self.cls_pred(cls_feat))
+            outs["reg"].append(self.reg_pred(reg_feat))
+            outs["kpt"].append(self.kpt_pred(kpt_feat))
+            outs["attr"].append(self.attr_pred(attr_feat))
         return outs
 
 

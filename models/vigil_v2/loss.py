@@ -29,20 +29,19 @@ def _iou_xyxy(pred, target):
 # ── 分类损失 ──
 
 def _cls_loss(pred, target, alpha=0.5, gamma=2.0):
-    """分类损失，支持硬标签和软标签。
+    """分类损失，使用硬正样本标签和 focal-style 负样本权重。
 
-    正样本 (target > 0): BCE 天然支持软标签 (target=0.3 时 sigmoid 最优值=0.3),
-        weight=target (高质量匹配权重高，低质量自动降权)。
+    正样本 (target > 0): hard target=1.0，直接推动正样本置信度升高。
     负样本 (target == 0): Focal 压制 α·pt^γ，大量易分背景被抑制。
 
     Args:
         pred: [N, C] logits
-        target: [N, C] ∈ [0, 1], 0=背景, >0=正样本(可为软标签)
+        target: [N, C] ∈ {0, 1}, 0=背景, 1=正样本
     """
     bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
     pt = torch.exp(-bce)
     pos_mask = target > 0
-    # 正样本: target 本身是质量权重, 低质量匹配自然贡献小
+    # 正样本: hard target=1, 负样本: focal 权重抑制易分背景
     pos_weight = target
     # 负样本: Focal 抑制, 但对 hard negative (假阳性) 保持高权重
     neg_weight = alpha * (1 - pt).pow(gamma)
@@ -165,6 +164,8 @@ class VigilLossV2(nn.Module):
         loss_smoke = torch.tensor(0.0, device=device)
         total_pos = 0
         total_person_pos = 0
+        total_helmet_pos = 0
+        total_smoke_pos = 0
 
         proj = torch.arange(self.reg_max, device=device, dtype=torch.float32)
 
@@ -189,10 +190,6 @@ class VigilLossV2(nn.Module):
             gt_boxes = targets["gt_boxes"].to(device)
             gt_classes = targets["gt_classes"].to(device)
             batch_idx = targets["batch_idx"].to(device)
-            align_scores = targets.get("align_score", torch.ones(N_pos, device=device))
-            if isinstance(align_scores, torch.Tensor):
-                align_scores = align_scores.to(device)
-
             gx, gy = grid[:, 0], grid[:, 1]
 
             # ── 提取 head 预测 (仅正样本位置) ──
@@ -220,11 +217,9 @@ class VigilLossV2(nn.Module):
             # ── IoU ──
             iou, _, _ = _iou_xyxy(pred_xyxy, gt_boxes)
 
-            # ── 填充正样本 cls target (质量感知软标签) ──
+            # ── 填充正样本 cls target ──
             flat_idx = gy * W + gx  # [N_pos]
-            # alignment 得分作为软标签: floor=0.3 保证冷启动梯度充足
-            soft_targets = align_scores.clamp(min=0.3, max=1.0)
-            cls_tgt_all[batch_idx, flat_idx, gt_classes] = soft_targets
+            cls_tgt_all[batch_idx, flat_idx, gt_classes] = 1.0
 
             # cls loss on ALL positions (正+负), sum-based
             loss_cls += _cls_loss(
@@ -287,19 +282,33 @@ class VigilLossV2(nn.Module):
                 # 头盔
                 if targets["gt_helmet"] is not None:
                     gt_h = targets["gt_helmet"].to(device).float()
-                    loss_helm += _focal_bce(attr_p[p_idx, 0], 1 - gt_h, gamma=2.0, pos_weight=4.0)
+                    valid_h = gt_h >= 0
+                    if valid_h.any():
+                        total_helmet_pos += valid_h.sum().item()
+                        loss_helm += _focal_bce(
+                            attr_p[p_idx[valid_h], 0],
+                            1 - gt_h[valid_h],
+                            gamma=2.0,
+                            pos_weight=4.0)
 
                 # 吸烟
                 if targets["gt_smoking"] is not None:
                     gt_s = targets["gt_smoking"].to(device).float()
-                    loss_smoke += _focal_bce(attr_p[p_idx, 1], gt_s, gamma=2.0, pos_weight=6.0)
+                    valid_s = gt_s >= 0
+                    if valid_s.any():
+                        total_smoke_pos += valid_s.sum().item()
+                        loss_smoke += _focal_bce(
+                            attr_p[p_idx[valid_s], 1],
+                            gt_s[valid_s],
+                            gamma=2.0,
+                            pos_weight=6.0)
 
         return {
             "cls":    self.w_cls   * (loss_cls / max(total_pos, 1)),
             "ciou":   self.w_box   * loss_ciou / max(total_pos, 1),
             "dfl":    self.w_dfl   * loss_dfl / max(total_pos, 1),
             "kpt":    self.w_kpt   * (loss_kpt / max(total_person_pos, 1)),
-            "helmet": self.w_helm  * (loss_helm / max(total_person_pos, 1)),
-            "smoke":  self.w_smoke * (loss_smoke / max(total_person_pos, 1)),
+            "helmet": self.w_helm  * (loss_helm / max(total_helmet_pos, 1)),
+            "smoke":  self.w_smoke * (loss_smoke / max(total_smoke_pos, 1)),
             "num_pos": total_pos,
         }

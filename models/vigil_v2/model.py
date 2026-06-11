@@ -26,18 +26,17 @@ from models.vigil_v2.loss import VigilLossV2
 
 class VigilModelV2(VigilModelBase, nn.Module):
 
-    def __init__(self, backbone_w=0.75, neck_ch=160, reg_max=16,
+    def __init__(self, backbone_w=1.5, neck_ch=320, reg_max=16,
                  w_box=5.0, w_cls=1.0, w_dfl=12.0,
                  w_kpt=10.0, w_helm=10.0, w_smoke=10.0,
-                 assigner_topk=20, head_dropout=0.1):
+                 assigner_topk=13):
         super().__init__()
         self.backbone = CSPDarkNetV2(w=backbone_w)
         self.neck = GatherDistributeNeck(
             in_channels=self.backbone.out_channels[1:4],  # p3, p4, p5
             out_ch=neck_ch,
         )
-        self.head = VigilHeadV2(neck_ch, num_classes=3, reg_max=reg_max,
-                                dropout=head_dropout)
+        self.head = VigilHeadV2(neck_ch, num_classes=3, reg_max=reg_max)
         self.strides = [8, 16, 32]
         self.reg_max = reg_max
         self._input_size = (640, 640)
@@ -161,41 +160,49 @@ class VigilModelV2(VigilModelBase, nn.Module):
 
     def detect(self, frame: np.ndarray) -> dict:
         h, w = frame.shape[:2]
-        sx, sy = w / self._input_size[0], h / self._input_size[1]
 
-        tensor = self._preprocess(frame).to(next(self.parameters()).device)
+        tensor, scale, (pad_l, pad_t) = self._preprocess(frame)
+        tensor = tensor.to(next(self.parameters()).device)
         raw = self.forward(tensor)
         det = self._decode(raw)
 
         for entry in det.values():
-            entry["boxes"][:, 0] *= sx
-            entry["boxes"][:, 2] *= sx
-            entry["boxes"][:, 1] *= sy
-            entry["boxes"][:, 3] *= sy
+            entry["boxes"][:, [0, 2]] = (entry["boxes"][:, [0, 2]] - pad_l) / scale
+            entry["boxes"][:, [1, 3]] = (entry["boxes"][:, [1, 3]] - pad_t) / scale
+            entry["boxes"][:, [0, 2]] = entry["boxes"][:, [0, 2]].clamp(0, w)
+            entry["boxes"][:, [1, 3]] = entry["boxes"][:, [1, 3]].clamp(0, h)
             if "kpts" in entry:
-                entry["kpts"][..., 0] *= sx
-                entry["kpts"][..., 1] *= sy
+                entry["kpts"][..., 0] = ((entry["kpts"][..., 0] - pad_l) / scale).clamp(0, w)
+                entry["kpts"][..., 1] = ((entry["kpts"][..., 1] - pad_t) / scale).clamp(0, h)
         return det
 
-    def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
-        img = cv2.resize(frame, self._input_size, interpolation=cv2.INTER_LINEAR)
+    def _preprocess(self, frame: np.ndarray):
+        in_w, in_h = self._input_size
+        h, w = frame.shape[:2]
+        scale = min(in_w / w, in_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        pad_w, pad_h = in_w - new_w, in_h - new_h
+        pad_l, pad_t = pad_w // 2, pad_h // 2
+        img = cv2.copyMakeBorder(
+            img, pad_t, pad_h - pad_t, pad_l, pad_w - pad_l,
+            cv2.BORDER_CONSTANT, value=(114, 114, 114))
         img = img.astype(np.float32) / 255.0
         img = (img - self._mean) / self._std
         img = np.transpose(img, (2, 0, 1))
-        return torch.from_numpy(img).unsqueeze(0)
+        return torch.from_numpy(img).unsqueeze(0), scale, (pad_l, pad_t)
 
     def _decode(self, raw_outputs, score_thresh=0.0) -> dict:
         boxes, scores, kpts, helmet, smoking = decode_outputs_v2(
             raw_outputs, self.strides, self.reg_max, score_thresh)
         boxes, scores = boxes[0], scores[0]
         kpts, helmet, smoking = kpts[0], helmet[0], smoking[0]
-        max_scores, best_cls = scores.max(dim=-1)
-
         result = {}
         for cls_idx, cls_name in [(0, "person"), (1, "fire"), (2, "water")]:
-            mask = best_cls == cls_idx
+            cls_scores = scores[:, cls_idx]
+            mask = cls_scores > score_thresh
             if mask.any():
-                entry = {"boxes": boxes[mask], "scores": max_scores[mask]}
+                entry = {"boxes": boxes[mask], "scores": cls_scores[mask]}
                 if cls_name == "person":
                     entry["kpts"]    = kpts[mask]
                     entry["helmet"]  = helmet[mask]
@@ -287,6 +294,16 @@ def create_model(pretrained=None, **kwargs):
     if pretrained:
         ckpt = torch.load(pretrained, map_location="cpu", weights_only=False)
         state = ckpt.get("model_state_dict", ckpt)
-        model.load_state_dict(state, strict=False)
+        try:
+            model.load_state_dict(state, strict=False)
+        except RuntimeError as exc:
+            if "size mismatch" in str(exc):
+                raise RuntimeError(
+                    f"Failed to load {pretrained!r}: checkpoint tensor shapes do not "
+                    "match the requested VigilModelV2 architecture. Make sure "
+                    "backbone_w/neck_ch are the same as the training run, or retrain "
+                    "before using the new model size."
+                ) from exc
+            raise
 
     return model
