@@ -29,7 +29,7 @@ class VigilModelV2(VigilModelBase, nn.Module):
     def __init__(self, backbone_w=1.5, neck_ch=320, reg_max=16,
                  w_box=5.0, w_cls=1.0, w_dfl=12.0,
                  w_kpt=10.0, w_helm=10.0, w_smoke=10.0,
-                 assigner_topk=13):
+                 assigner_topk=13, cls_weights=None):
         super().__init__()
         self.backbone = CSPDarkNetV2(w=backbone_w)
         self.neck = GatherDistributeNeck(
@@ -47,7 +47,7 @@ class VigilModelV2(VigilModelBase, nn.Module):
         self.loss_fn = VigilLossV2(
             w_box=w_box, w_cls=w_cls, w_dfl=w_dfl,
             w_kpt=w_kpt, w_helm=w_helm, w_smoke=w_smoke,
-            reg_max=reg_max)
+            reg_max=reg_max, cls_weights=cls_weights)
 
     @property
     def input_size(self):

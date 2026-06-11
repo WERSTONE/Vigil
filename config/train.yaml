@@ -20,8 +20,8 @@ training:
   val_ratio: 0.2           # 验证集比例 (0.3→0.2, 保留更多训练数据)
   grad_clip: 20.0          # 梯度裁剪
   log_interval: 100         # 多少 batch 输出一次训练日志
-  val_interval:  1         # 多少 epoch 验证一次
-  save_interval: 3        # 多少 epoch 存一次 checkpoint
+  val_interval:  3         # 多少 epoch 验证一次
+  save_interval: 5        # 多少 epoch 存一次 checkpoint
 
 # ── AMP 混合精度 (不影响 resume) ──
 amp:
@@ -65,13 +65,14 @@ map:
 
 # ── COCO person/pose 预训练阶段 ──
 coco_pose_pretrain:
-  epochs: 120
+  epochs: 300
   datasets:
     coco_person_pose: {path: "data/processed/coco_person_pose"}
   freeze: []
   # 这里的 w_helm/w_smoke 是 loss 权重，不是标签取值。
   # helmet 标签仍然是 0=戴帽, 1=未戴帽。
   model_kwargs:
+    cls_weights: [1.0, 0.0, 0.0]  # COCO 阶段只监督 person 分类，不压低 fire/water 通道
     w_helm: 0.0
     w_smoke: 0.0
   optimizer:

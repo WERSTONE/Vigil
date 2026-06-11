@@ -8,7 +8,7 @@ import torch.nn.functional as F
 # ── 关键点 OKS sigmas (COCO 17 kpts) ──
 KPT_SIGMAS = torch.tensor([
     0.026, 0.025, 0.025, 0.035, 0.035, 0.079, 0.079, 0.072,
-    0.072, 0.062, 0.062, 1.007, 1.007, 0.087, 0.087, 0.089, 0.089,
+    0.072, 0.062, 0.062, 0.107, 0.107, 0.087, 0.087, 0.089, 0.089,
 ])
 
 
@@ -28,7 +28,7 @@ def _iou_xyxy(pred, target):
 
 # ── 分类损失 ──
 
-def _cls_loss(pred, target, alpha=0.5, gamma=2.0):
+def _cls_loss(pred, target, alpha=0.5, gamma=2.0, class_weights=None):
     """分类损失，使用硬正样本标签和 focal-style 负样本权重。
 
     正样本 (target > 0): hard target=1.0，直接推动正样本置信度升高。
@@ -46,7 +46,10 @@ def _cls_loss(pred, target, alpha=0.5, gamma=2.0):
     # 负样本: Focal 抑制, 但对 hard negative (假阳性) 保持高权重
     neg_weight = alpha * (1 - pt).pow(gamma)
     weight = torch.where(pos_mask, pos_weight, neg_weight)
-    return (weight * bce).sum()
+    loss = weight * bce
+    if class_weights is not None:
+        loss = loss * class_weights.view(1, -1).to(pred.device)
+    return loss.sum()
 
 
 # ── 框回归损失 ──
@@ -133,7 +136,7 @@ class VigilLossV2(nn.Module):
 
     def __init__(self, w_box=5.0, w_cls=1.0, w_dfl=12.0,
                  w_kpt=10.0, w_helm=10.0, w_smoke=10.0,
-                 reg_max=16, kpt_sigmas=None):
+                 reg_max=16, kpt_sigmas=None, cls_weights=None):
         super().__init__()
         self.w_box = w_box
         self.w_cls = w_cls
@@ -142,6 +145,9 @@ class VigilLossV2(nn.Module):
         self.w_helm = w_helm
         self.w_smoke = w_smoke
         self.reg_max = reg_max
+        if cls_weights is not None:
+            cls_weights = torch.as_tensor(cls_weights, dtype=torch.float32)
+        self.register_buffer("cls_weights", cls_weights)
         self.register_buffer("sigmas",
             kpt_sigmas if kpt_sigmas is not None else KPT_SIGMAS)
 
@@ -180,7 +186,8 @@ class VigilLossV2(nn.Module):
             if targets is None:
                 loss_cls += _cls_loss(
                     cls_p_all.reshape(-1, 3),
-                    cls_tgt_all.reshape(-1, 3))
+                    cls_tgt_all.reshape(-1, 3),
+                    class_weights=self.cls_weights)
                 continue
 
             N_pos = len(targets["gt_boxes"])
@@ -224,7 +231,8 @@ class VigilLossV2(nn.Module):
             # cls loss on ALL positions (正+负), sum-based
             loss_cls += _cls_loss(
                 cls_p_all.reshape(-1, 3),
-                cls_tgt_all.reshape(-1, 3))
+                cls_tgt_all.reshape(-1, 3),
+                class_weights=self.cls_weights)
 
             # ── 框回归损失 (CIoU, 转为 sum 以便按 total_pos 归一化) ──
             loss_ciou += _ciou_loss(pred_xyxy, gt_boxes) * N_pos
