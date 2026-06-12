@@ -22,7 +22,7 @@ training:
   log_interval: 100         # 多少 batch 输出一次训练日志
   val_interval:  3         # 多少 epoch 验证一次
   save_interval: 5        # 多少 epoch 存一次 checkpoint
-  save_best_by: "val_loss"  # "val_loss" 或 "map"; 选择 "map" 时必须设置 map.enabled: true
+  save_best_by: "loss"     # "loss" 或 "score"; 选择 "score" 时必须设置 map.enabled: true
 
 # ── AMP 混合精度 (不影响 resume) ──
 amp:

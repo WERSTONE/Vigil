@@ -50,15 +50,17 @@ def main():
     log_interval = train_cfg.get("log_interval", 10)
     save_interval = train_cfg.get("save_interval", 10)
     val_interval = train_cfg.get("val_interval", 1)
-    save_best_by = str(train_cfg.get("save_best_by", "val_loss")).lower()
+    save_best_by = str(train_cfg.get("save_best_by", "loss")).lower()
+    if save_best_by in ("val_loss", "val_total"):
+        save_best_by = "loss"
     if save_best_by in ("map", "map@0.5", "map50"):
-        save_best_by = "map"
-    if save_best_by not in ("val_loss", "map"):
-        raise ValueError("training.save_best_by must be 'val_loss' or 'map'")
+        save_best_by = "score"
+    if save_best_by not in ("loss", "score"):
+        raise ValueError("training.save_best_by must be 'loss' or 'score'")
     map_cfg = cfg.get("map", {})
     map_enabled = map_cfg.get("enabled", False)
-    if save_best_by == "map" and not map_enabled:
-        raise ValueError("training.save_best_by='map' requires map.enabled=true in train.yaml")
+    if save_best_by == "score" and not map_enabled:
+        raise ValueError("training.save_best_by='score' requires map.enabled=true in train.yaml")
     tb_cfg = cfg.get("tensorboard", {})
     use_tb = tb_cfg.get("enabled", False)
     tb_log_dir = tb_cfg.get("log_dir", "logs/train_logs")
@@ -86,8 +88,8 @@ def main():
 
     model = create_model(model_name, pretrained=pretrained, **model_kwargs)
     print(f"  params: {model.num_params/1e6:.2f}M")
-    if save_best_by == "map" and not hasattr(model, "predict_val"):
-        raise ValueError(f"model {model_name!r} does not implement predict_val, cannot save best by mAP")
+    if save_best_by == "score" and not hasattr(model, "predict_val_full"):
+        raise ValueError(f"model {model_name!r} does not implement predict_val_full, cannot save best by score")
 
     for part in freeze:
         if hasattr(model, part):

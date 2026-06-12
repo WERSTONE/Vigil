@@ -253,6 +253,75 @@ class VigilModelV2(VigilModelBase, nn.Module):
                 torch.zeros(0, device=device),
                 torch.zeros(0, dtype=torch.long, device=device))
 
+    @torch.no_grad()
+    def predict_val_full(self, sample):
+        """Run validation detection with person keypoints and attributes."""
+        device = next(self.parameters()).device
+        img = sample.image.unsqueeze(0).to(device)
+        head_outs = self.forward(img)
+
+        boxes_3d, scores_3d, kpts_3d, helmet_3d, smoke_3d = decode_outputs_v2(
+            head_outs, self.strides, self.reg_max, score_thresh=0.01)
+
+        boxes = boxes_3d[0]
+        scores = scores_3d[0]
+        kpts = kpts_3d[0]
+        helmet = helmet_3d[0]
+        smoke = smoke_3d[0]
+
+        all_boxes, all_scores, all_cls = [], [], []
+        person_boxes, person_scores, person_kpts = [], [], []
+        person_helmet, person_smoke = [], []
+        for c in range(3):
+            cls_scores = scores[:, c]
+            keep = cls_scores > 0.01
+            if keep.any():
+                c_boxes = boxes[keep]
+                c_scores = cls_scores[keep]
+                nms_k = _nms(c_boxes, c_scores, 0.6)
+                all_boxes.append(c_boxes[nms_k])
+                all_scores.append(c_scores[nms_k])
+                all_cls.append(torch.full((len(nms_k),), c, dtype=torch.long, device=device))
+                if c == 0:
+                    person_boxes.append(c_boxes[nms_k])
+                    person_scores.append(c_scores[nms_k])
+                    person_kpts.append(kpts[keep][nms_k])
+                    person_helmet.append(helmet[keep][nms_k])
+                    person_smoke.append(smoke[keep][nms_k])
+
+        if all_boxes:
+            flat_boxes = torch.cat(all_boxes)
+            flat_scores = torch.cat(all_scores)
+            flat_cls = torch.cat(all_cls)
+        else:
+            flat_boxes = torch.zeros(0, 4, device=device)
+            flat_scores = torch.zeros(0, device=device)
+            flat_cls = torch.zeros(0, dtype=torch.long, device=device)
+
+        if person_boxes:
+            p_boxes = torch.cat(person_boxes)
+            p_scores = torch.cat(person_scores)
+            p_kpts = torch.cat(person_kpts)
+            p_helmet = torch.cat(person_helmet)
+            p_smoke = torch.cat(person_smoke)
+        else:
+            p_boxes = torch.zeros(0, 4, device=device)
+            p_scores = torch.zeros(0, device=device)
+            p_kpts = torch.zeros(0, 17, 3, device=device)
+            p_helmet = torch.zeros(0, device=device)
+            p_smoke = torch.zeros(0, device=device)
+
+        return {
+            "boxes": flat_boxes,
+            "scores": flat_scores,
+            "classes": flat_cls,
+            "person_boxes": p_boxes,
+            "person_scores": p_scores,
+            "person_kpts": p_kpts,
+            "person_helmet": p_helmet,
+            "person_smoke": p_smoke,
+        }
+
     @property
     def num_params(self):
         return sum(p.numel() for p in self.parameters())

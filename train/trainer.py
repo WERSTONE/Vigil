@@ -28,7 +28,7 @@ class Trainer:
                  use_tensorboard=False, tb_log_dir="logs/train_logs",
                  use_amp=False, amp_dtype="float16",
                  map_enabled=True, map_samples=500,
-                 save_best_by="val_loss",
+                 save_best_by="loss",
                  ema_decay=0.9999):
         self.model = model.to(device)
         self.device = device
@@ -46,10 +46,10 @@ class Trainer:
 
         self.current_epoch = 0
         self.global_step = 0
-        if save_best_by not in ("val_loss", "map"):
-            raise ValueError("save_best_by must be 'val_loss' or 'map'")
+        if save_best_by not in ("loss", "score"):
+            raise ValueError("save_best_by must be 'loss' or 'score'")
         self.save_best_by = save_best_by
-        self.best_score = -float("inf") if save_best_by == "map" else float("inf")
+        self.best_score = -float("inf") if save_best_by == "score" else float("inf")
 
         self.map_enabled = map_enabled
         self.map_samples = map_samples
@@ -309,6 +309,133 @@ class Trainer:
         self._swap_ema(to_ema=True)  # swap back
         return mAP, aps
 
+    @torch.no_grad()
+    def _compute_score_metrics(self, val_loaders, max_samples=500):
+        """Compute composite validation score.
+
+        score is the mean of available metrics among:
+        mAP@0.5, keypoint PCK accuracy, helmet accuracy, and smoke accuracy.
+        Keypoints are counted correct when visible GT keypoints fall within
+        5% of the matched person box max side. Person matching uses IoU >= 0.5.
+        """
+        self.model.eval()
+        self._swap_ema(to_ema=True)
+
+        all_preds = []
+        all_gts = []
+        kpt_correct = kpt_total = 0
+        helmet_correct = helmet_total = 0
+        smoke_correct = smoke_total = 0
+        collected = 0
+
+        try:
+            for dl in val_loaders.values():
+                for batch in dl:
+                    for sample in batch:
+                        if collected >= max_samples:
+                            break
+                        pred = self.model.predict_val_full(sample)
+
+                        p_boxes = pred["boxes"].detach().cpu().numpy().astype(np.float32)
+                        p_scores = pred["scores"].detach().cpu().numpy().astype(np.float32)
+                        p_cls = pred["classes"].detach().cpu().numpy().astype(np.int32)
+                        all_preds.append((p_boxes, p_scores, p_cls))
+
+                        gt_list_b, gt_list_c = [], []
+                        if sample.person_boxes.numel() > 0:
+                            n = len(sample.person_boxes)
+                            gt_list_b.append(sample.person_boxes.numpy())
+                            gt_list_c.append(np.zeros(n, dtype=np.int32))
+                        if sample.detect_boxes.numel() > 0:
+                            gt_list_b.append(sample.detect_boxes.numpy())
+                            gt_list_c.append(sample.detect_classes.numpy().astype(np.int32))
+
+                        if gt_list_b:
+                            all_gts.append((np.concatenate(gt_list_b, axis=0),
+                                            np.concatenate(gt_list_c, axis=0)))
+                        else:
+                            all_gts.append((np.zeros((0, 4), dtype=np.float32),
+                                            np.zeros(0, dtype=np.int32)))
+
+                        if sample.person_boxes.numel() > 0:
+                            gt_boxes = sample.person_boxes.numpy().astype(np.float32)
+                            gt_kpts = sample.person_kpts.numpy().astype(np.float32)
+                            gt_helmet = sample.person_helmet.numpy().astype(np.float32)
+                            gt_smoke = sample.person_smoke.numpy().astype(np.float32)
+
+                            pred_boxes = pred["person_boxes"].detach().cpu().numpy().astype(np.float32)
+                            pred_scores = pred["person_scores"].detach().cpu().numpy().astype(np.float32)
+                            pred_kpts = pred["person_kpts"].detach().cpu().numpy().astype(np.float32)
+                            pred_helmet_logits = pred["person_helmet"].detach().cpu()
+                            pred_smoke_logits = pred["person_smoke"].detach().cpu()
+
+                            matched_gt = set()
+                            for pi in np.argsort(-pred_scores):
+                                if len(gt_boxes) == 0:
+                                    break
+                                ious = self._box_iou_batch(pred_boxes[pi], gt_boxes)
+                                for gi in np.argsort(-ious):
+                                    if int(gi) in matched_gt:
+                                        continue
+                                    if ious[gi] < 0.5:
+                                        continue
+                                    matched_gt.add(int(gi))
+
+                                    visible = gt_kpts[gi, :, 2] > 0
+                                    if visible.any():
+                                        box = gt_boxes[gi]
+                                        scale = max(box[2] - box[0], box[3] - box[1], 1.0)
+                                        dist = np.linalg.norm(
+                                            pred_kpts[pi, :, :2] - gt_kpts[gi, :, :2], axis=1)
+                                        kpt_correct += int((dist[visible] <= 0.05 * scale).sum())
+                                        kpt_total += int(visible.sum())
+
+                                    if gi < len(gt_helmet) and gt_helmet[gi] >= 0:
+                                        helmet_prob = torch.sigmoid(pred_helmet_logits[pi]).item()
+                                        pred_helmet = 0 if helmet_prob > 0.5 else 1
+                                        helmet_correct += int(pred_helmet == int(gt_helmet[gi]))
+                                        helmet_total += 1
+
+                                    if gi < len(gt_smoke) and gt_smoke[gi] >= 0:
+                                        smoke_prob = torch.sigmoid(pred_smoke_logits[pi]).item()
+                                        pred_smoke = 1 if smoke_prob > 0.5 else 0
+                                        smoke_correct += int(pred_smoke == int(gt_smoke[gi]))
+                                        smoke_total += 1
+                                    break
+
+                        collected += 1
+                    if collected >= max_samples:
+                        break
+                if collected >= max_samples:
+                    break
+
+            aps = {}
+            for cls_idx, cls_name in [(0, "person"), (1, "fire"), (2, "water")]:
+                aps[cls_name] = self._compute_ap(all_preds, all_gts, cls_idx)
+            valid_ap = [v for v in aps.values() if v is not None]
+            mAP = float(np.mean(valid_ap)) if valid_ap else 0.0
+
+            metrics = {"mAP@0.5": mAP}
+            for k, v in aps.items():
+                if v is not None:
+                    metrics[f"AP_{k}"] = v
+
+            if kpt_total > 0:
+                metrics["kpt_acc"] = kpt_correct / kpt_total
+            if helmet_total > 0:
+                metrics["helmet_acc"] = helmet_correct / helmet_total
+            if smoke_total > 0:
+                metrics["smoke_acc"] = smoke_correct / smoke_total
+
+            score_parts = [metrics["mAP@0.5"]]
+            for key in ("kpt_acc", "helmet_acc", "smoke_acc"):
+                if key in metrics:
+                    score_parts.append(metrics[key])
+            metrics["score"] = float(np.mean(score_parts)) if score_parts else 0.0
+            return metrics
+        finally:
+            self._swap_ema(to_ema=True)
+
     def _compute_ap(self, all_preds, all_gts, cls_idx, iou_thresh=0.5):
         """Compute AP@iou_thresh for a single class (101-point interpolation)."""
         import numpy as np
@@ -457,33 +584,27 @@ class Trainer:
                     for k, v in val_m.items():
                         self.writer.add_scalar(f"epoch/{k}", v, epoch)
 
-                # ── mAP ──
-                mAP = None
-                if self.map_enabled and hasattr(self.model, "predict_val"):
+                score_metrics = None
+                if self.map_enabled and hasattr(self.model, "predict_val_full"):
                     try:
-                        mAP, aps = self._compute_map(val_loaders, max_samples=self.map_samples)
-                        val_m["mAP@0.5"] = mAP
-                        for k, v in aps.items():
-                            if v is not None:
-                                val_m[f"AP_{k}"] = v
-                        ap_parts = " ".join(
-                            f"AP_{k}={v:.4f}" if v is not None else f"AP_{k}=N/A"
-                            for k, v in aps.items())
-                        log += f" | mAP@.5={mAP:.4f} ({ap_parts})"
+                        score_metrics = self._compute_score_metrics(
+                            val_loaders, max_samples=self.map_samples)
+                        val_m.update(score_metrics)
+                        metric_parts = " ".join(
+                            f"{k}={v:.4f}" for k, v in sorted(score_metrics.items()))
+                        log += " | " + metric_parts
                         if self.writer:
-                            self.writer.add_scalar("epoch/mAP@0.5", mAP, epoch)
-                            for k, v in aps.items():
-                                if v is not None:
-                                    self.writer.add_scalar(f"epoch/AP_{k}", v, epoch)
+                            for k, v in score_metrics.items():
+                                self.writer.add_scalar(f"epoch/{k}", v, epoch)
                     except Exception as e:
-                        if self.save_best_by == "map":
-                            raise RuntimeError("save_best_by='map' requires successful mAP computation") from e
-                        log += f" | mAP=err({e})"
+                        if self.save_best_by == "score":
+                            raise RuntimeError("save_best_by='score' requires successful score computation") from e
+                        log += f" | score=err({e})"
 
-                if self.save_best_by == "map":
-                    if mAP is None:
-                        raise RuntimeError("save_best_by='map' requires map.enabled=true and model.predict_val")
-                    current = mAP
+                if self.save_best_by == "score":
+                    if score_metrics is None:
+                        raise RuntimeError("save_best_by='score' requires map.enabled=true and model.predict_val_full")
+                    current = score_metrics["score"]
                     improved = current > self.best_score
                 else:
                     current = val_m.get("val_total", float("inf"))
@@ -492,8 +613,8 @@ class Trainer:
                     self.best_score = current
                     self.save(self.save_dir / f"{save_prefix}_best.pt", val_m)
             elif not val_loaders:
-                if self.save_best_by == "map":
-                    raise RuntimeError("save_best_by='map' requires a validation set")
+                if self.save_best_by == "score":
+                    raise RuntimeError("save_best_by='score' requires a validation set")
                 if train_m["loss"] < self.best_score:
                     self.best_score = train_m["loss"]
 
