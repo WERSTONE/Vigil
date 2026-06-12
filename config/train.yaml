@@ -22,7 +22,7 @@ training:
   log_interval: 100         # 多少 batch 输出一次训练日志
   val_interval:  3         # 多少 epoch 验证一次
   save_interval: 5        # 多少 epoch 存一次 checkpoint
-  save_best_by: "map"  # "val_loss" 或 "map"; 选择 "map" 时必须设置 map.enabled: true
+  save_best_by: "val_loss"  # "val_loss" 或 "map"; 选择 "map" 时必须设置 map.enabled: true
 
 # ── AMP 混合精度 (不影响 resume) ──
 amp:
@@ -61,7 +61,7 @@ augmentation:
 
 # ── mAP 验证 ──
 map:
-  enabled: true             # 是否在验证时计算 mAP@0.5
+  enabled: false             # 是否在验证时计算 mAP@0.5
   val_samples: 0          # 每次验证采样的图片数 (越大越精确也越慢, 0=全部)
 
 # ── COCO person/pose 预训练阶段 ──
