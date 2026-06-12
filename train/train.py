@@ -50,6 +50,15 @@ def main():
     log_interval = train_cfg.get("log_interval", 10)
     save_interval = train_cfg.get("save_interval", 10)
     val_interval = train_cfg.get("val_interval", 1)
+    save_best_by = str(train_cfg.get("save_best_by", "val_loss")).lower()
+    if save_best_by in ("map", "map@0.5", "map50"):
+        save_best_by = "map"
+    if save_best_by not in ("val_loss", "map"):
+        raise ValueError("training.save_best_by must be 'val_loss' or 'map'")
+    map_cfg = cfg.get("map", {})
+    map_enabled = map_cfg.get("enabled", False)
+    if save_best_by == "map" and not map_enabled:
+        raise ValueError("training.save_best_by='map' requires map.enabled=true in train.yaml")
     tb_cfg = cfg.get("tensorboard", {})
     use_tb = tb_cfg.get("enabled", False)
     tb_log_dir = tb_cfg.get("log_dir", "logs/train_logs")
@@ -77,6 +86,8 @@ def main():
 
     model = create_model(model_name, pretrained=pretrained, **model_kwargs)
     print(f"  params: {model.num_params/1e6:.2f}M")
+    if save_best_by == "map" and not hasattr(model, "predict_val"):
+        raise ValueError(f"model {model_name!r} does not implement predict_val, cannot save best by mAP")
 
     for part in freeze:
         if hasattr(model, part):
@@ -117,8 +128,9 @@ def main():
         use_tensorboard=use_tb, tb_log_dir=tb_log_dir,
         use_amp=amp_cfg.get("enabled", False),
         amp_dtype=amp_cfg.get("dtype", "float16"),
-        map_enabled=cfg.get("map", {}).get("enabled", False),
-        map_samples=cfg.get("map", {}).get("val_samples", 500),
+        map_enabled=map_enabled,
+        map_samples=map_cfg.get("val_samples", 500),
+        save_best_by=save_best_by,
     )
 
     if args.resume:

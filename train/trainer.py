@@ -28,6 +28,7 @@ class Trainer:
                  use_tensorboard=False, tb_log_dir="logs/train_logs",
                  use_amp=False, amp_dtype="float16",
                  map_enabled=True, map_samples=500,
+                 save_best_by="val_loss",
                  ema_decay=0.9999):
         self.model = model.to(device)
         self.device = device
@@ -45,7 +46,10 @@ class Trainer:
 
         self.current_epoch = 0
         self.global_step = 0
-        self.best_loss = float("inf")
+        if save_best_by not in ("val_loss", "map"):
+            raise ValueError("save_best_by must be 'val_loss' or 'map'")
+        self.save_best_by = save_best_by
+        self.best_score = -float("inf") if save_best_by == "map" else float("inf")
 
         self.map_enabled = map_enabled
         self.map_samples = map_samples
@@ -425,7 +429,8 @@ class Trainer:
               f"Datasets: {list(train_loaders.keys())}")
         if dataset_weights:
             print(f"  dataset_weights={dataset_weights}")
-        print(f"  save_interval={self.save_interval} val_interval={self.val_interval}")
+        print(f"  save_interval={self.save_interval} val_interval={self.val_interval} "
+              f"save_best_by={self.save_best_by}")
         print(f"{'='*50}")
 
         for epoch in range(self.current_epoch, epochs):
@@ -453,9 +458,14 @@ class Trainer:
                         self.writer.add_scalar(f"epoch/{k}", v, epoch)
 
                 # ── mAP ──
+                mAP = None
                 if self.map_enabled and hasattr(self.model, "predict_val"):
                     try:
                         mAP, aps = self._compute_map(val_loaders, max_samples=self.map_samples)
+                        val_m["mAP@0.5"] = mAP
+                        for k, v in aps.items():
+                            if v is not None:
+                                val_m[f"AP_{k}"] = v
                         ap_parts = " ".join(
                             f"AP_{k}={v:.4f}" if v is not None else f"AP_{k}=N/A"
                             for k, v in aps.items())
@@ -466,15 +476,26 @@ class Trainer:
                                 if v is not None:
                                     self.writer.add_scalar(f"epoch/AP_{k}", v, epoch)
                     except Exception as e:
+                        if self.save_best_by == "map":
+                            raise RuntimeError("save_best_by='map' requires successful mAP computation") from e
                         log += f" | mAP=err({e})"
 
-                current = val_m.get("val_total", float("inf"))
-                if current < self.best_loss:
-                    self.best_loss = current
+                if self.save_best_by == "map":
+                    if mAP is None:
+                        raise RuntimeError("save_best_by='map' requires map.enabled=true and model.predict_val")
+                    current = mAP
+                    improved = current > self.best_score
+                else:
+                    current = val_m.get("val_total", float("inf"))
+                    improved = current < self.best_score
+                if improved:
+                    self.best_score = current
                     self.save(self.save_dir / f"{save_prefix}_best.pt", val_m)
             elif not val_loaders:
-                if train_m["loss"] < self.best_loss:
-                    self.best_loss = train_m["loss"]
+                if self.save_best_by == "map":
+                    raise RuntimeError("save_best_by='map' requires a validation set")
+                if train_m["loss"] < self.best_score:
+                    self.best_score = train_m["loss"]
 
             print(log)
 
@@ -482,6 +503,6 @@ class Trainer:
                 self.save(self.save_dir / f"{save_prefix}_epoch{epoch+1}.pt")
 
         self.save(self.save_dir / f"{save_prefix}_last.pt")
-        print(f"Best: {self.best_loss:.4f}")
+        print(f"Best {self.save_best_by}: {self.best_score:.4f}")
 
         self.close()

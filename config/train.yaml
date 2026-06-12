@@ -22,6 +22,7 @@ training:
   log_interval: 100         # 多少 batch 输出一次训练日志
   val_interval:  3         # 多少 epoch 验证一次
   save_interval: 5        # 多少 epoch 存一次 checkpoint
+  save_best_by: "map"  # "val_loss" 或 "map"; 选择 "map" 时必须设置 map.enabled: true
 
 # ── AMP 混合精度 (不影响 resume) ──
 amp:
@@ -34,7 +35,7 @@ cudnn:
 
 # ── DataLoader 优化 ──
 dataloader:
-  num_workers: 4           # 子进程数 (5 数据集 × 2 < 默认 fd 上限)
+  num_workers: 8           # 子进程数 (5 数据集 × 2 < 默认 fd 上限)
   pin_memory: true          # 锁页内存 → GPU 传输更快
   persistent_workers: true  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
   prefetch_factor: 2
@@ -60,8 +61,8 @@ augmentation:
 
 # ── mAP 验证 ──
 map:
-  enabled: false             # 是否在验证时计算 mAP@0.5
-  val_samples: 500          # 每次验证采样的图片数 (越大越精确也越慢, 0=全部)
+  enabled: true             # 是否在验证时计算 mAP@0.5
+  val_samples: 0          # 每次验证采样的图片数 (越大越精确也越慢, 0=全部)
 
 # ── COCO person/pose 预训练阶段 ──
 coco_pose_pretrain:

@@ -5,8 +5,8 @@
 model:
   name: "vigil_v2"
   kwargs:
-    backbone_w: 0.5
-    neck_ch: 128
+    backbone_w: 1.5
+    neck_ch: 320
 
 # ── 推理配置 ──
 inference:
